@@ -92,3 +92,37 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for EventCapture {
         });
     }
 }
+
+#[derive(Clone, Default)]
+pub(crate) struct RenderedLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl RenderedLogs {
+    pub(crate) fn install(filter: &str) -> (Self, tracing::subscriber::DefaultGuard) {
+        let capture = Self::default();
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        (capture, tracing::subscriber::set_default(subscriber))
+    }
+
+    pub(crate) fn rendered(&self) -> String {
+        String::from_utf8(self.0.lock().expect("capture lock").clone()).expect("UTF-8 logs")
+    }
+}
+
+impl std::io::Write for RenderedLogs {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .expect("capture lock")
+            .extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}

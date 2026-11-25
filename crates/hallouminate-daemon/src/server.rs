@@ -957,7 +957,14 @@ mod tests {
         configure(&mut cfg, tmp.path());
         let bytes = request(tmp.path());
         let state = DaemonState::open(cfg, None).await.expect("open state");
-        let socket = tmp.path().join("request.sock");
+        exchange_on_socket(state, tmp.path().join("request.sock"), bytes).await
+    }
+
+    async fn exchange_on_socket(
+        state: DaemonState,
+        socket: PathBuf,
+        bytes: Vec<u8>,
+    ) -> Option<DaemonResponse> {
         let listener = UnixListener::bind(&socket).expect("bind request socket");
         let client = tokio::spawn(async move {
             let mut stream = UnixStream::connect(&socket).await.expect("connect request");
@@ -1128,9 +1135,86 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_json_request_logs_one_debug_event() {
+    async fn logging_ground_search_failure_has_one_error_and_keeps_wire_message() {
+        use hallouminate_domain::common::CorpusConfig;
+        use std::os::unix::ffi::OsStrExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let seed = tmp.path().join("seed");
+        std::fs::create_dir(&seed).expect("create seed root");
+        std::fs::write(seed.join("note.md"), "# Seed\n\nFixture text.\n").expect("write seed");
+        let broken = tmp.path().join("broken");
+        let non_utf8 = tmp
+            .path()
+            .join(std::ffi::OsStr::from_bytes(b"non-utf8-root-\xff"));
+        std::fs::create_dir(&non_utf8).expect("create non-UTF-8 root");
+        std::os::unix::fs::symlink(non_utf8, &broken).expect("link broken root");
+
+        let mut cfg = Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.search.cold_wait_ms = 0;
+        cfg.storage.ground_dir = tmp.path().join("ground").display().to_string();
+        for (name, path) in [("seed", seed), ("broken", broken)] {
+            cfg.corpora.push(CorpusConfig {
+                name: name.into(),
+                paths: vec![path.display().to_string()],
+                globs: vec!["**/*.md".into()],
+                exclude: Vec::new(),
+                global: false,
+            });
+        }
+        let state = DaemonState::open(cfg, None).await.expect("open state");
+        let index: DaemonRequest = serde_json::from_value(serde_json::json!({
+            "cwd": tmp.path(),
+            "payload": {"op": "index", "corpus": "seed"},
+        }))
+        .expect("build index request");
+        let indexed = dispatch(&state, index).await;
+        let DaemonResponse::Ok { result } = indexed else {
+            panic!("index seed: {indexed:?}");
+        };
+        assert_eq!(result["corpora"][0]["name"], "seed", "{result}");
+
+        let query = "private-ground-query-c94b";
+        let request = serde_json::to_vec(&serde_json::json!({
+            "cwd": tmp.path(),
+            "payload": {"op": "ground", "corpus": "broken", "query": query, "match_mode": "phrase"},
+        }))
+        .expect("serialize ground request");
+        let (capture, _guard) = crate::test_support::RenderedLogs::install("hallouminate=info");
+        let response =
+            exchange_on_socket(state, tmp.path().join("ground-test.sock"), request).await;
+        let DaemonResponse::Err { kind, message } = response.expect("response") else {
+            panic!("the store must reject the non-UTF-8 root");
+        };
+        assert_eq!(kind, super::super::ipc::ErrorKind::Internal);
+        assert_eq!(
+            message,
+            "ground failed (indexer error); the daemon log has the cause"
+        );
+
+        let logs = capture.rendered();
+        let mut failures = Vec::new();
+        for line in logs.lines() {
+            if line.contains("ground failed") || line.contains(r#"op="ground""#) {
+                failures.push(line);
+            }
+        }
+        assert_eq!(failures.len(), 1, "{logs}");
+        assert!(failures[0].contains(" ERROR "), "{logs}");
+        assert!(failures[0].contains(r#"op="ground""#), "{logs}");
+        assert!(failures[0].contains("kind=Internal"), "{logs}");
+        assert!(failures[0].contains("indexer error"), "{logs}");
+        assert!(!logs.contains(query), "{logs}");
+    }
+
+    #[tokio::test]
+    async fn logging_invalid_json_keeps_request_values_only_on_wire() {
+        let marker = "private-request-op-8f25";
         let (capture, _guard) = crate::test_support::EventCapture::install();
-        let message = invalid_request_message(exchange_request(b"not json\n".to_vec()).await);
+        let request = format!(r#"{{"cwd":".","payload":{{"op":"{marker}"}}}}"#);
+        let message = invalid_request_message(exchange_request(request.into_bytes()).await);
+        assert!(message.contains(marker), "{message}");
         let events = daemon_events(&capture);
         let mut failures = Vec::new();
         for event in &events {
@@ -1147,7 +1231,8 @@ mod tests {
         );
         assert_eq!(event.fields.get("op"), None);
         let logged = event.fields.get("message").expect("message field");
-        assert!(logged.contains(&message), "{logged} lacks {message}");
+        assert!(!logged.contains(marker), "{logged}");
+        assert_eq!(logged, "request failed");
     }
 
     #[tokio::test]
@@ -1160,15 +1245,24 @@ mod tests {
     }
 
     #[test]
-    fn error_kinds_log_at_their_levels() {
+    fn logging_error_kinds_use_their_levels_without_non_internal_message_text() {
         let (capture, _guard) = crate::test_support::EventCapture::install();
-        log_error_response(Some("ground"), &DaemonResponse::retryable("busy"));
-        log_error_response(Some("ground"), &DaemonResponse::invalid_params("bad"));
+        log_error_response(
+            Some("ground"),
+            &DaemonResponse::retryable("private-retryable-91e7"),
+        );
+        log_error_response(
+            Some("ground"),
+            &DaemonResponse::invalid_params("private-invalid-902f"),
+        );
         log_error_response(Some("ground"), &DaemonResponse::internal("boom"));
         log_error_response(Some("ground"), &DaemonResponse::ok(&"fine"));
         let mut levels = Vec::new();
         for event in daemon_events(&capture) {
             levels.push(event.level);
+            if event.level != tracing::Level::ERROR {
+                assert_eq!(event.fields["message"], "request failed");
+            }
         }
         assert_eq!(
             levels,
@@ -1181,18 +1275,22 @@ mod tests {
     }
 
     #[test]
-    fn failure_diagnostics_escape_control_characters() {
+    fn internal_failure_diagnostics_escape_controls_without_changing_wire_text() {
         let (capture, _guard) = crate::test_support::EventCapture::install();
-        let response = DaemonResponse::invalid_params("first\r\nsecond\tline");
-        log_error_response(Some("list_files"), &response);
+        let response = DaemonResponse::internal("first\r\nsecond\tline");
+        let (sent, frame) = response_frame(response).expect("frame error response");
+        log_error_response(Some("list_files"), &sent);
         let events = daemon_events(&capture);
         assert_eq!(events.len(), 1, "{events:?}");
         let logged = events[0].fields.get("message").expect("message field");
         assert_eq!(logged, r"request failed: first\r\nsecond\tline");
-        assert_eq!(
-            invalid_request_message(Some(response)),
-            "first\r\nsecond\tline"
-        );
+        let DaemonResponse::Err { kind, message } =
+            serde_json::from_str(&frame).expect("decode wire response")
+        else {
+            panic!("response must be an error");
+        };
+        assert_eq!(kind, super::super::ipc::ErrorKind::Internal);
+        assert_eq!(message, "first\r\nsecond\tline");
     }
 
     #[tokio::test]

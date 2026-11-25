@@ -1340,7 +1340,7 @@ impl HallouminateTools {
                         op = "add_markdown_batch",
                         item = index,
                         kind = ?kind,
-                        "daemon returned an item error: {message}",
+                        "daemon returned an item error",
                     );
                     Err(map_daemon_err(DaemonRpcError { kind, message }.into()))
                 }

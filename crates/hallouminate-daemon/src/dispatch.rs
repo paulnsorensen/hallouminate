@@ -58,6 +58,7 @@ use hallouminate_domain::repository::{RepoCorpusKind, repo_corpus_name};
 use hallouminate_domain::repository::{RepositoryConfig, default_wiki_for_cwd};
 use hallouminate_domain::search::validate_phrase;
 
+use super::failure_log::escape_controls;
 use super::ipc::{
     AddMarkdownBatchResult, AddMarkdownItem, AddMarkdownRequest, AddMarkdownResult, BUILD_IDENTITY,
     BacklinksRequest, BacklinksResult, CorpusEntry, CorpusStatsResult, DaemonRequest,
@@ -855,11 +856,7 @@ async fn handle_ground(
     DaemonResponse::ok(&GroundResult { outline, response })
 }
 
-/// Logs a ground failure with its cause and builds the client response.
-///
-/// The daemon log is a local file, so it carries the raw error. The client
-/// message carries the error text only for classes that cannot echo the
-/// query; the other classes name the subsystem alone.
+/// Builds the Ground error response without echoing queries.
 fn ground_failure_response(
     error: &hallouminate_domain::common::HallouminateError,
 ) -> DaemonResponse {
@@ -873,12 +870,6 @@ fn ground_failure_response(
         HallouminateError::Indexer(_) => ("indexer", true),
         HallouminateError::Search(_) => ("search", true),
     };
-    tracing::warn!(
-        target: "hallouminate::daemon",
-        error = %error,
-        class,
-        "ground failed",
-    );
     if echoes_query {
         DaemonResponse::internal(format!(
             "ground failed ({class} error); the daemon log has the cause"
@@ -1400,8 +1391,7 @@ async fn handle_add_markdown(
         tracing::warn!(
             target: "hallouminate::daemon",
             count = ancestor_problems.len(),
-            first = %ancestor_problems[0],
-            path = %dest.display(),
+            path = %escape_controls(&dest.to_string_lossy()),
             "add_markdown: ancestor index refresh failed after durable write",
         );
         warnings.push(format!(
@@ -4827,11 +4817,8 @@ mod tests {
         }
     }
 
-    /// WHY: a failed ground must leave its cause in the daemon log at WARN,
-    /// and the client text must hold the cause only for classes that cannot
-    /// echo the query.
     #[test]
-    fn ground_failure_logs_cause_and_gates_client_text_by_class() {
+    fn logging_ground_failure_response_preserves_wire_messages_without_a_handler_log() {
         use hallouminate_domain::common::HallouminateError;
 
         let (capture, _guard) = crate::test_support::EventCapture::install();
@@ -4843,26 +4830,30 @@ mod tests {
         let search = HallouminateError::Search("rg: secret-query-text".to_string());
 
         let stale_message = match ground_failure_response(&stale) {
-            DaemonResponse::Err { message, .. } => message,
+            DaemonResponse::Err { kind, message } => {
+                assert_eq!(kind, ErrorKind::Internal);
+                message
+            }
             DaemonResponse::Ok { .. } => panic!("ground failure must be an error response"),
         };
         let search_message = match ground_failure_response(&search) {
-            DaemonResponse::Err { message, .. } => message,
+            DaemonResponse::Err { kind, message } => {
+                assert_eq!(kind, ErrorKind::Internal);
+                message
+            }
             DaemonResponse::Ok { .. } => panic!("ground failure must be an error response"),
         };
 
-        assert!(stale_message.contains("/stale/ground"), "{stale_message}");
-        assert!(
-            !search_message.contains("secret-query-text"),
-            "{search_message}"
+        assert_eq!(
+            stale_message,
+            format!("ground failed (store schema error): {stale}")
+        );
+        assert_eq!(
+            search_message,
+            "ground failed (search error); the daemon log has the cause"
         );
         let events = capture.events_for("hallouminate::daemon");
-        assert_eq!(events.len(), 2, "{events:?}");
-        for event in &events {
-            assert_eq!(event.level, tracing::Level::WARN);
-        }
-        assert!(events[0].fields["error"].contains("/stale/ground"));
-        assert!(events[1].fields["error"].contains("secret-query-text"));
+        assert!(events.is_empty(), "{events:?}");
     }
 
     /// WHY (AC-6): a ground call on a never-registered root registers it and

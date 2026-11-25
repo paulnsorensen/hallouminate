@@ -16,6 +16,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 
 use super::bootstrap::ensure_daemon_running;
+use super::failure_log::escape_controls;
 use super::framing::{MAX_IPC_LINE_BYTES, ipc_lines};
 use super::ipc::{DaemonRequest, DaemonRequestPayload, DaemonResponse, ErrorKind};
 use super::socket::daemon_socket_path;
@@ -64,8 +65,8 @@ where
             if let Err(error) = &connected {
                 tracing::warn!(
                     target: "hallouminate::client",
-                    socket = %path.display(),
-                    error = %format_args!("{error:#}"),
+                    socket = %escape_controls(&path.to_string_lossy()),
+                    error = %escape_controls(&format!("{error:#}")),
                     "daemon unreachable",
                 );
             }
@@ -91,15 +92,15 @@ where
     };
     tracing::info!(
         target: "hallouminate::client",
-        socket = %socket.display(),
-        error = %format_args!("{error:#}"),
+        socket = %escape_controls(&socket.to_string_lossy()),
+        error = %escape_controls(&format!("{error:#}")),
         "daemon unreachable; spawning one",
     );
     if let Err(error) = respawn().await {
         tracing::warn!(
             target: "hallouminate::client",
-            socket = %socket.display(),
-            error = %format_args!("{error:#}"),
+            socket = %escape_controls(&socket.to_string_lossy()),
+            error = %escape_controls(&format!("{error:#}")),
             "daemon spawn failed",
         );
         return Err(error);
@@ -108,8 +109,8 @@ where
     if let Err(error) = &connected {
         tracing::warn!(
             target: "hallouminate::client",
-            socket = %socket.display(),
-            error = %format_args!("{error:#}"),
+            socket = %escape_controls(&socket.to_string_lossy()),
+            error = %escape_controls(&format!("{error:#}")),
             "daemon unreachable after spawn",
         );
     }
@@ -154,11 +155,7 @@ impl DaemonClient {
     /// absent daemon use [`Self::call_raw_quiet`] instead.
     pub async fn call_raw(&self, req: DaemonRequest) -> anyhow::Result<DaemonResponse> {
         let op = req.payload.op_name();
-        let result = self.call_raw_quiet(req).await;
-        if let Err(error) = &result {
-            self.log_call_failure(op, error);
-        }
-        result
+        self.call_raw_inner(req, Some(op)).await
     }
 
     /// [`Self::call_raw`] without the failure log, for probes whose callers
@@ -167,6 +164,28 @@ impl DaemonClient {
         &self,
         req: DaemonRequest,
     ) -> anyhow::Result<DaemonResponse> {
+        self.call_raw_inner(req, None).await
+    }
+
+    async fn call_raw_inner(
+        &self,
+        req: DaemonRequest,
+        log_op: Option<&'static str>,
+    ) -> anyhow::Result<DaemonResponse> {
+        let line = self.read_reply(req).await.inspect_err(|error| {
+            if let Some(op) = log_op {
+                self.log_call_failure(op, error);
+            }
+        })?;
+        serde_json::from_str(&line).map_err(|error| {
+            if let Some(op) = log_op {
+                log_decode_failure(op, &error, "invalid daemon response");
+            }
+            daemon_client_unavailable("invalid daemon response")
+        })
+    }
+
+    async fn read_reply(&self, req: DaemonRequest) -> anyhow::Result<String> {
         let mut text = serde_json::to_string(&req)?;
         text.push('\n');
         if let DaemonRequestPayload::AddMarkdownBatch { .. } = &req.payload
@@ -200,14 +219,8 @@ impl DaemonClient {
                 self.socket.display(),
             )));
         };
-        let line = line.map_err(|e| {
+        line.map_err(|e| {
             daemon_client_unavailable(format!("read from {} failed: {e}", self.socket.display()))
-        })?;
-        serde_json::from_str(&line).map_err(|e| {
-            daemon_client_unavailable(format!(
-                "invalid daemon response from {}: {e} (response: {line:?})",
-                self.socket.display(),
-            ))
         })
     }
 
@@ -222,8 +235,8 @@ impl DaemonClient {
         tracing::warn!(
             target: "hallouminate::client",
             op,
-            socket = %self.socket.display(),
-            error = %format_args!("{error:#}"),
+            socket = %escape_controls(&self.socket.to_string_lossy()),
+            error = %escape_controls(&format!("{error:#}")),
             "daemon call failed",
         );
     }
@@ -248,11 +261,8 @@ impl DaemonClient {
         timeout: Duration,
     ) -> anyhow::Result<DaemonResponse> {
         let op = req.payload.op_name();
-        let result = self.call_raw_with_timeout_quiet(req, timeout).await;
-        if let Err(error) = &result {
-            self.log_call_failure(op, error);
-        }
-        result
+        self.call_raw_with_timeout_inner(req, timeout, Some(op))
+            .await
     }
 
     /// [`Self::call_raw_with_timeout`] without the failure log, for
@@ -262,18 +272,33 @@ impl DaemonClient {
         req: DaemonRequest,
         timeout: Duration,
     ) -> anyhow::Result<DaemonResponse> {
+        self.call_raw_with_timeout_inner(req, timeout, None).await
+    }
+
+    async fn call_raw_with_timeout_inner(
+        &self,
+        req: DaemonRequest,
+        timeout: Duration,
+        log_op: Option<&'static str>,
+    ) -> anyhow::Result<DaemonResponse> {
         let mut timeout_hint = "the daemon may be busy — retry";
         if let DaemonRequestPayload::AddMarkdownBatch { .. } = &req.payload {
             timeout_hint = "batch completion is uncertain; inspect files before retrying. No automatic retry or rollback occurred";
         }
-        match tokio::time::timeout(timeout, self.call_raw_quiet(req)).await {
+        match tokio::time::timeout(timeout, self.call_raw_inner(req, log_op)).await {
             Ok(result) => result,
-            Err(_elapsed) => Err(DaemonRpcError::retryable(format!(
-                "no response from {} within {}s; {timeout_hint}",
-                self.socket.display(),
-                timeout.as_secs(),
-            ))
-            .into()),
+            Err(_elapsed) => {
+                let error = DaemonRpcError::retryable(format!(
+                    "no response from {} within {}s; {timeout_hint}",
+                    self.socket.display(),
+                    timeout.as_secs(),
+                ))
+                .into();
+                if let Some(op) = log_op {
+                    self.log_call_failure(op, &error);
+                }
+                Err(error)
+            }
         }
     }
 
@@ -286,21 +311,16 @@ impl DaemonClient {
         let op = req.payload.op_name();
         let timeout = timeout_for(&req.payload);
         match self.call_raw_with_timeout(req, timeout).await? {
-            DaemonResponse::Ok { result } => serde_json::from_value(result).map_err(|e| {
-                tracing::warn!(
-                    target: "hallouminate::client",
-                    op,
-                    error = %e,
-                    "daemon returned an unexpected payload",
-                );
-                anyhow::anyhow!("daemon returned unexpected payload: {e}")
+            DaemonResponse::Ok { result } => serde_json::from_value(result).map_err(|error| {
+                log_decode_failure(op, &error, "daemon returned an unexpected payload");
+                anyhow::anyhow!("daemon returned unexpected payload")
             }),
             DaemonResponse::Err { kind, message } => {
                 tracing::debug!(
                     target: "hallouminate::client",
                     op,
                     kind = ?kind,
-                    "daemon returned an error: {message}",
+                    "daemon returned an error",
                 );
                 match kind {
                     ErrorKind::InvalidParams => Err(DaemonRpcError::invalid_params(message).into()),
@@ -310,6 +330,17 @@ impl DaemonClient {
             }
         }
     }
+}
+
+fn log_decode_failure(op: &'static str, error: &serde_json::Error, message: &'static str) {
+    tracing::warn!(
+        target: "hallouminate::client",
+        op,
+        category = ?error.classify(),
+        line = error.line(),
+        column = error.column(),
+        "{message}",
+    );
 }
 
 /// Per-request-class RPC deadline for [`DaemonClient::call`]. Reads
@@ -521,12 +552,11 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn daemon_error_is_logged_at_debug_when_mapped() {
+    async fn read_markdown_reply(reply: String) -> (anyhow::Error, String) {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let sock_path = tmp.path().join("err.sock");
-        let listener = tokio::net::UnixListener::bind(&sock_path).expect("bind");
-        tokio::spawn(async move {
+        let socket = tmp.path().join("read.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind");
+        let server = tokio::spawn(async move {
             let (stream, _addr) = listener.accept().await.expect("accept");
             let (read_half, mut write_half) = stream.into_split();
             let mut request = String::new();
@@ -534,30 +564,102 @@ mod tests {
                 .read_line(&mut request)
                 .await
                 .expect("read request");
-            let mut line = serde_json::to_string(&DaemonResponse::internal("store exploded"))
-                .expect("serialize response");
-            line.push('\n');
+            let request: DaemonRequest = serde_json::from_str(&request).expect("decode request");
+            assert_eq!(request.payload.op_name(), "read_markdown");
             write_half
-                .write_all(line.as_bytes())
+                .write_all(reply.as_bytes())
                 .await
                 .expect("write response");
         });
-        let client = DaemonClient { socket: sock_path };
-        let (capture, _guard) = crate::test_support::EventCapture::install();
-        let err = client
-            .call::<serde_json::Value>(DaemonRequest {
-                cwd: PathBuf::from("."),
-                payload: DaemonRequestPayload::Status,
+        let (capture, _guard) = crate::test_support::RenderedLogs::install("hallouminate=debug");
+        let client = DaemonClient { socket };
+        let error = client
+            .call::<super::super::ipc::ReadMarkdownResult>(DaemonRequest {
+                cwd: tmp.path().to_path_buf(),
+                payload: DaemonRequestPayload::ReadMarkdown(ReadMarkdownRequest {
+                    corpus: None,
+                    path: "example.md".into(),
+                }),
             })
             .await
-            .expect_err("a daemon error must fail the call");
-        let rpc = err.downcast_ref::<DaemonRpcError>().expect("typed error");
+            .expect_err("reply must fail");
+        server.await.expect("reply server");
+        (error, capture.rendered())
+    }
+
+    #[tokio::test]
+    async fn logging_truncated_read_markdown_reply_omits_document_text() {
+        let marker = "private-truncated-markdown-5d18";
+        let reply = format!(r#"{{"status":"ok","result":{{"content":"{marker}""#);
+        let column = reply.len();
+        let (error, logs) = read_markdown_reply(reply).await;
+        assert!(!logs.contains(marker), "{logs}");
+        assert_eq!(logs.lines().count(), 1, "{logs}");
+        assert!(logs.contains(" WARN "), "{logs}");
+        assert!(logs.contains(r#"op="read_markdown""#), "{logs}");
+        assert!(logs.contains("category=Eof"), "{logs}");
+        assert!(logs.contains("line=1"), "{logs}");
+        assert!(logs.contains(&format!("column={column}")), "{logs}");
+        assert!(!logs.contains("socket="), "{logs}");
+        assert_eq!(
+            format!("{error:#}"),
+            "daemon unavailable: invalid daemon response (start it with `hallouminate daemon`)"
+        );
+        assert!(error.downcast_ref::<DaemonRpcError>().is_none());
+    }
+
+    #[tokio::test]
+    async fn logging_unexpected_read_markdown_payload_omits_serde_values() {
+        let marker = "private-invalid-markdown-2c3f";
+        let reply = serde_json::json!({
+            "status": "ok",
+            "result": {
+                "corpus": "docs",
+                "path": "example.md",
+                "absolute_path": "/docs/example.md",
+                "content": "",
+                "bytes": marker,
+            },
+        });
+        let (error, logs) = read_markdown_reply(reply.to_string()).await;
+        assert!(!logs.contains(marker), "{logs}");
+        assert_eq!(logs.lines().count(), 1, "{logs}");
+        assert!(logs.contains(" WARN "), "{logs}");
+        assert!(logs.contains(r#"op="read_markdown""#), "{logs}");
+        assert!(logs.contains("category=Data"), "{logs}");
+        assert_eq!(format!("{error:#}"), "daemon returned unexpected payload");
+    }
+
+    #[tokio::test]
+    async fn logging_transport_warning_escapes_socket_controls() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let socket = tmp.path().join("first\nsecond.sock");
+        let (capture, _guard) = crate::test_support::RenderedLogs::install("hallouminate=info");
+        let error = client_for(Some(&socket))
+            .await
+            .expect_err("connect to a missing socket must fail");
+        assert!(error.to_string().contains("first\nsecond.sock"));
+        let logs = capture.rendered();
+        assert_eq!(logs.lines().count(), 1, "{logs}");
+        assert!(logs.contains(" WARN "), "{logs}");
+        assert!(logs.contains("daemon unreachable"), "{logs}");
+        assert!(logs.contains(r"first\nsecond.sock"), "{logs}");
+    }
+
+    #[tokio::test]
+    async fn logging_mapped_daemon_error_keeps_message_only_on_typed_error() {
+        let message = "private-mapped-daemon-message-3e8c";
+        let reply =
+            serde_json::to_string(&DaemonResponse::internal(message)).expect("serialize response");
+        let (error, logs) = read_markdown_reply(reply).await;
+        let rpc = error.downcast_ref::<DaemonRpcError>().expect("typed error");
         assert_eq!(rpc.kind, ErrorKind::Internal);
-        let debugs = client_events(&capture, tracing::Level::DEBUG);
-        assert_eq!(debugs.len(), 1, "{debugs:?}");
-        let message = debugs[0].fields.get("message").expect("message field");
-        assert!(message.contains("store exploded"), "{message}");
-        assert!(client_events(&capture, tracing::Level::WARN).is_empty());
+        assert_eq!(rpc.message, message);
+        assert_eq!(logs.lines().count(), 1, "{logs}");
+        assert!(logs.contains(" DEBUG "), "{logs}");
+        assert!(logs.contains(r#"op="read_markdown""#), "{logs}");
+        assert!(logs.contains("kind=Internal"), "{logs}");
+        assert!(!logs.contains(message), "{logs}");
     }
 
     #[tokio::test]
