@@ -1380,18 +1380,6 @@ impl WatchRegistry {
         }
     }
 
-    /// Releases the retained ownership slot after an ordinary cleanup finishes.
-    pub(crate) fn finish_ordinary_cleanup(&self, owner: &Arc<AtomicBool>) {
-        let mut guard = self.lock();
-        if let Some(index) = guard
-            .detached
-            .iter()
-            .position(|entry| Arc::ptr_eq(&entry.token, owner))
-        {
-            guard.detached.remove(index);
-        }
-    }
-
     /// Admits retries and deferred retirements in FIFO order, up to the task cap.
     pub(crate) fn take_pending_cleanups(&self) -> Vec<RetiredRegistration> {
         let mut guard = self.lock();
@@ -1495,6 +1483,11 @@ impl WatchRegistry {
             }
         }
         false
+    }
+
+    #[cfg(test)]
+    pub(super) fn retired_runtime_count(&self) -> usize {
+        self.retired_runtime.load(Ordering::SeqCst)
     }
 
     pub(crate) fn detached_probes(&self) -> Vec<(Arc<()>, Vec<PathBuf>)> {
