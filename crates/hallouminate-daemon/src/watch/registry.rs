@@ -25,10 +25,11 @@ use std::sync::{Arc, Mutex};
 
 use hallouminate_config::Config;
 use hallouminate_domain::common::{CorpusConfig, CorpusKey};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::state::corpus_lock_keys;
 
-use super::WatchRoot;
+use super::{RootResolution, WatchRoot};
 
 /// Who asked for a corpus to be watched. Distinguishes the boot baseline
 /// (seeded once at watcher startup) from a later runtime discovery rooted at
@@ -204,6 +205,7 @@ struct Registration {
     lock_keys: Vec<CorpusKey>,
     cfg: Arc<Config>,
     roots: Vec<WatchRoot>,
+    retirement_due: bool,
     observation: Observation,
     pending: PendingWork,
     catch_up: CatchUpState,
@@ -244,9 +246,9 @@ pub(crate) enum RegisterOutcome {
 }
 
 /// Retired registration data needed for fail-closed storage cleanup.
-/// `roots` lists every watch root the registration stored rows under, and
-/// `lock_keys` is the corpus-lock set cleanup takes before touching them.
-#[derive(Debug, Clone)]
+/// `roots` holds canonical storage keys, and `lock_keys` is the corpus-lock
+/// set cleanup takes before touching them.
+#[derive(Debug)]
 pub(crate) struct RetiredRegistration {
     pub(crate) corpus: String,
     pub(crate) root: PathBuf,
@@ -254,6 +256,7 @@ pub(crate) struct RetiredRegistration {
     pub(crate) lock_keys: Vec<CorpusKey>,
     pub(crate) cfg: Arc<Config>,
     pub(crate) failed_attempts: u32,
+    pub(crate) _permit: OwnedSemaphorePermit,
 }
 
 impl RetiredRegistration {
@@ -264,15 +267,18 @@ impl RetiredRegistration {
             .is_multiple_of(REPEAT_FAILURE_REMINDER_EVERY)
     }
 
-    fn from_registration(id: &RegistrationId, registration: &Registration) -> Self {
-        let mut roots: Vec<PathBuf> = registration
-            .roots
-            .iter()
-            .map(|root| match &root.canonical_file_root {
-                Some(file) => file.clone(),
-                None => root.canonical_watched.clone(),
-            })
-            .collect();
+    fn from_registration(
+        id: &RegistrationId,
+        registration: &Registration,
+        permit: OwnedSemaphorePermit,
+    ) -> Self {
+        let mut roots = Vec::new();
+        for root in &registration.roots {
+            match &root.canonical_file_root {
+                Some(file) => roots.push(file.clone()),
+                None => roots.push(root.canonical_watched.clone()),
+            }
+        }
         if roots.is_empty() {
             roots.push(id.corpus_key.canonical_root.clone());
         }
@@ -283,6 +289,7 @@ impl RetiredRegistration {
             lock_keys: registration.lock_keys.clone(),
             cfg: registration.cfg.clone(),
             failed_attempts: 0,
+            _permit: permit,
         }
     }
 }
@@ -339,6 +346,7 @@ pub(crate) struct WatchRegistry {
     boot_catch_up_running: std::sync::atomic::AtomicBool,
     /// Retired registrations whose storage cleanup failed and must retry.
     pending_cleanups: Mutex<Vec<RetiredRegistration>>,
+    cleanup_slots: Arc<Semaphore>,
 }
 
 /// Whether the boot catch-up sweep is still reconciling baseline corpora.
@@ -372,6 +380,7 @@ impl WatchRegistry {
             pump_unavailable: std::sync::atomic::AtomicBool::new(false),
             boot_catch_up_running: std::sync::atomic::AtomicBool::new(false),
             pending_cleanups: Mutex::new(Vec::new()),
+            cleanup_slots: Arc::new(Semaphore::new(MAX_PENDING_CLEANUPS)),
         }
     }
 
@@ -426,6 +435,7 @@ impl WatchRegistry {
                 corpus,
                 cfg,
                 roots,
+                retirement_due: false,
                 observation: Observation::Watched,
                 pending: PendingWork::Idle,
                 catch_up: CatchUpState::Done,
@@ -459,18 +469,18 @@ impl WatchRegistry {
         let mut guard = self.lock();
         let obsolete: Vec<RegistrationId> = guard
             .regs
-            .keys()
-            .filter(|existing| {
+            .iter()
+            .filter(|(existing, reg)| {
                 existing.source == id.source
                     && existing.corpus_key.name == id.corpus_key.name
                     && existing.corpus_key != id.corpus_key
+                    && !reg.retirement_due
             })
-            .cloned()
+            .map(|(existing, _)| existing.clone())
             .collect();
-        let unchanged = guard
-            .regs
-            .get(&id)
-            .is_some_and(|existing| registration_equivalent(existing, &corpus, &cfg, &roots));
+        let unchanged = guard.regs.get(&id).is_some_and(|existing| {
+            !existing.retirement_due && registration_equivalent(existing, &corpus, &cfg, &roots)
+        });
         if unchanged {
             let existing = guard.regs.get_mut(&id).expect("checked above");
             existing.lock_keys = corpus_lock_keys(&corpus);
@@ -533,6 +543,7 @@ impl WatchRegistry {
                 corpus,
                 cfg,
                 roots,
+                retirement_due: false,
                 observation,
                 pending: PendingWork::Idle,
                 catch_up: CatchUpState::Queued,
@@ -564,6 +575,7 @@ impl WatchRegistry {
         self.lock().regs.iter().any(|(id, existing)| {
             id.source == *source
                 && id.corpus_key.name == corpus.name
+                && !existing.retirement_due
                 && registration_equivalent(existing, corpus, cfg, roots)
         })
     }
@@ -595,21 +607,33 @@ impl WatchRegistry {
     where
         F: Fn(&CorpusConfig) -> Vec<WatchRoot>,
     {
-        let snapshot: Vec<(RegistrationId, CorpusConfig)> = {
+        let snapshot: Vec<(RegistrationId, CorpusConfig, Vec<WatchRoot>)> = {
             let guard = self.lock();
             guard
                 .regs
                 .iter()
-                .map(|(id, registration)| (id.clone(), registration.corpus.clone()))
+                .filter(|(_, registration)| !registration.retirement_due)
+                .map(|(id, registration)| {
+                    (
+                        id.clone(),
+                        registration.corpus.clone(),
+                        registration.roots.clone(),
+                    )
+                })
                 .collect()
         };
-        let built: Vec<(RegistrationId, Vec<WatchRoot>)> = snapshot
-            .into_iter()
-            .map(|(id, corpus)| {
-                let roots = build(&corpus);
-                (id, roots)
-            })
-            .collect();
+        let mut built = Vec::new();
+        for (id, corpus, previous) in snapshot {
+            let mut roots = build(&corpus);
+            for (index, root) in roots.iter_mut().enumerate() {
+                if root.resolution == RootResolution::Unresolved
+                    && let Some(old) = previous.get(index)
+                {
+                    *root = old.clone();
+                }
+            }
+            built.push((id, roots));
+        }
 
         let mut guard = self.lock();
         let stale: Vec<(RegistrationId, RegistrationId, Vec<WatchRoot>)> = built
@@ -664,7 +688,7 @@ impl WatchRegistry {
         self.lock()
             .regs
             .iter()
-            .filter(|(_, reg)| reg.roots.iter().any(|owned| owned == root))
+            .filter(|(_, reg)| !reg.retirement_due && reg.roots.iter().any(|owned| owned == root))
             .map(|(id, _)| id.clone())
             .collect()
     }
@@ -676,6 +700,7 @@ impl WatchRegistry {
             .lock()
             .regs
             .iter()
+            .filter(|(_, reg)| !reg.retirement_due)
             .flat_map(|(id, reg)| reg.roots.iter().map(move |root| (id.clone(), root.clone())))
             .collect();
         roots.sort_by(|(left, _), (right, _)| {
@@ -717,26 +742,37 @@ impl WatchRegistry {
             }
         }
         let candidate_ids: HashSet<_> = candidates.iter().map(|(id, ..)| id.clone()).collect();
-        let removed: HashSet<_> = guard
-            .regs
-            .keys()
-            .filter(|id| id.source == source && !candidate_ids.contains(*id))
-            .cloned()
-            .collect();
-        let retired = removed
-            .iter()
-            .filter_map(|id| {
-                guard
-                    .regs
-                    .get(id)
-                    .map(|registration| RetiredRegistration::from_registration(id, registration))
-            })
-            .collect();
+        let mut removed = HashSet::new();
+        let mut deferred = HashSet::new();
+        let mut retired = Vec::new();
+        for (id, registration) in &guard.regs {
+            if id.source != source || candidate_ids.contains(id) {
+                continue;
+            }
+            let Ok(permit) = self.cleanup_slots.clone().try_acquire_owned() else {
+                deferred.insert(id.clone());
+                continue;
+            };
+            retired.push(RetiredRegistration::from_registration(
+                id,
+                registration,
+                permit,
+            ));
+            removed.insert(id.clone());
+        }
         for id in &removed {
             guard.regs.remove(id);
             release_admission(&mut guard, id);
         }
-        guard.queue.retain(|id| !removed.contains(id));
+        for id in &deferred {
+            if let Some(reg) = guard.regs.get_mut(id) {
+                reg.retirement_due = true;
+            }
+            release_admission(&mut guard, id);
+        }
+        guard
+            .queue
+            .retain(|id| !removed.contains(id) && !deferred.contains(id));
         for (id, corpus, roots) in candidates {
             if let Some(existing) = guard.regs.get_mut(&id)
                 && registration_equivalent(existing, &corpus, &cfg, &roots)
@@ -744,6 +780,11 @@ impl WatchRegistry {
                 existing.lock_keys = corpus_lock_keys(&corpus);
                 existing.corpus = corpus;
                 existing.cfg = cfg.clone();
+                if existing.retirement_due {
+                    existing.retirement_due = false;
+                    existing.catch_up = CatchUpState::Queued;
+                    guard.queue.push_back(id);
+                }
                 continue;
             }
             if guard
@@ -761,6 +802,7 @@ impl WatchRegistry {
                     corpus,
                     cfg: cfg.clone(),
                     roots,
+                    retirement_due: false,
                     observation: Observation::Watched,
                     pending: PendingWork::Idle,
                     catch_up: CatchUpState::Queued,
@@ -778,6 +820,40 @@ impl WatchRegistry {
         self.signal_changed();
         self.settled.notify_waiters();
         Ok(retired)
+    }
+
+    /// Admits deferred config removals even when their source can no longer reload.
+    pub(crate) fn drain_deferred_retirements(&self) -> Vec<RetiredRegistration> {
+        let mut guard = self.lock();
+        let mut retired = Vec::new();
+        let mut removed = HashSet::new();
+        for (id, registration) in &guard.regs {
+            if !registration.retirement_due {
+                continue;
+            }
+            let Ok(permit) = self.cleanup_slots.clone().try_acquire_owned() else {
+                break;
+            };
+            retired.push(RetiredRegistration::from_registration(
+                id,
+                registration,
+                permit,
+            ));
+            removed.insert(id.clone());
+        }
+        if removed.is_empty() {
+            return retired;
+        }
+        for id in &removed {
+            guard.regs.remove(id);
+            release_admission(&mut guard, id);
+        }
+        guard.queue.retain(|id| !removed.contains(id));
+        guard.generation += 1;
+        drop(guard);
+        self.signal_changed();
+        self.settled.notify_waiters();
+        retired
     }
 
     pub(crate) fn repo_layer_sources(&self) -> Vec<PathBuf> {
@@ -801,7 +877,9 @@ impl WatchRegistry {
         paths: impl IntoIterator<Item = PathBuf>,
     ) {
         let mut guard = self.lock();
-        if let Some(reg) = guard.regs.get_mut(id) {
+        if let Some(reg) = guard.regs.get_mut(id)
+            && !reg.retirement_due
+        {
             reg.pending.add_paths(paths);
         }
         Self::mark_dirty_locked(&mut guard, id);
@@ -870,27 +948,16 @@ impl WatchRegistry {
         true
     }
 
-    /// Parks a retired registration whose storage cleanup failed. The pump
-    /// retries parked entries on each reconcile tick. The list holds at
-    /// most `MAX_PENDING_CLEANUPS`; the oldest entry drops first.
+    /// Parks a retired registration whose storage cleanup failed. Its owned
+    /// permit keeps active and parked cleanups within `MAX_PENDING_CLEANUPS`.
     pub(crate) fn park_failed_cleanup(&self, registration: RetiredRegistration) {
-        let mut pending = self
-            .pending_cleanups
+        self.pending_cleanups
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if pending.len() >= MAX_PENDING_CLEANUPS {
-            let dropped = pending.remove(0);
-            tracing::warn!(
-                target: "hallouminate::daemon",
-                corpus = %dropped.corpus,
-                root = %dropped.root.display(),
-                "watcher: pending retired-root cleanups full; dropping the oldest",
-            );
-        }
-        pending.push(registration);
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(registration);
     }
 
-    /// Drains the parked cleanups so the caller can retry them.
+    /// Drains parked cleanups for retry. Each entry retains its permit.
     pub(crate) fn take_pending_cleanups(&self) -> Vec<RetiredRegistration> {
         std::mem::take(
             &mut *self
@@ -907,6 +974,9 @@ impl WatchRegistry {
         let guard = self.lock();
         let mut probes = Vec::new();
         for (id, reg) in &guard.regs {
+            if reg.retirement_due {
+                continue;
+            }
             let mut roots = vec![id.corpus_key.canonical_root.clone()];
             for root in &reg.roots {
                 let path = match &root.canonical_file_root {
@@ -934,29 +1004,35 @@ impl WatchRegistry {
         threshold: u32,
     ) -> Vec<RetiredRegistration> {
         let mut guard = self.lock();
-        let mut expired = HashSet::new();
-        for (id, reg) in guard.regs.iter_mut() {
+        let mut expired = Vec::new();
+        for (id, reg) in &mut guard.regs {
             if !absent.contains(id) {
                 reg.absent_ticks = 0;
                 continue;
             }
             reg.absent_ticks = reg.absent_ticks.saturating_add(1);
-            if reg.absent_ticks >= threshold {
-                expired.insert(id.clone());
+            if reg.absent_ticks < threshold {
+                continue;
             }
+            let Ok(permit) = self.cleanup_slots.clone().try_acquire_owned() else {
+                continue;
+            };
+            expired.push((id.clone(), permit));
         }
         if expired.is_empty() {
             return Vec::new();
         }
         let mut retired = Vec::new();
-        for id in &expired {
-            let Some(reg) = guard.regs.remove(id) else {
+        let mut expired_ids = HashSet::new();
+        for (id, permit) in expired {
+            let Some(reg) = guard.regs.remove(&id) else {
                 continue;
             };
-            release_admission(&mut guard, id);
-            retired.push(RetiredRegistration::from_registration(id, &reg));
+            release_admission(&mut guard, &id);
+            retired.push(RetiredRegistration::from_registration(&id, &reg, permit));
+            expired_ids.insert(id);
         }
-        guard.queue.retain(|id| !expired.contains(id));
+        guard.queue.retain(|id| !expired_ids.contains(id));
         guard.generation += 1;
         drop(guard);
         self.signal_changed();
@@ -1066,7 +1142,12 @@ impl WatchRegistry {
     /// on a pass that is already pending or running.
     pub(crate) fn mark_reconcile_due_all(&self) {
         let mut guard = self.lock();
-        let ids: Vec<RegistrationId> = guard.regs.keys().cloned().collect();
+        let ids: Vec<RegistrationId> = guard
+            .regs
+            .iter()
+            .filter(|(_, reg)| !reg.retirement_due)
+            .map(|(id, _)| id.clone())
+            .collect();
         for id in ids {
             if let Some(reg) = guard.regs.get_mut(&id) {
                 reg.retry_on_tick = false;
@@ -1086,7 +1167,9 @@ impl WatchRegistry {
         let Some(reg) = guard.regs.get_mut(id) else {
             return;
         };
-        if matches!(reg.catch_up, CatchUpState::NotStarted | CatchUpState::Done) {
+        if !reg.retirement_due
+            && matches!(reg.catch_up, CatchUpState::NotStarted | CatchUpState::Done)
+        {
             reg.catch_up = CatchUpState::Queued;
             guard.queue.push_back(id.clone());
         }
@@ -1117,7 +1200,7 @@ impl WatchRegistry {
             let Some(reg) = inner.regs.get(&id) else {
                 continue;
             };
-            if reg.catch_up != CatchUpState::Queued {
+            if reg.retirement_due || reg.catch_up != CatchUpState::Queued {
                 continue;
             }
             if reg.retry_on_tick {
@@ -1142,7 +1225,8 @@ impl WatchRegistry {
                 .iter()
                 .filter(|candidate| {
                     inner.regs.get(*candidate).is_some_and(|member| {
-                        member.catch_up == CatchUpState::Queued
+                        !member.retirement_due
+                            && member.catch_up == CatchUpState::Queued
                             && member.corpus == leader_corpus
                             && member.roots == leader_roots
                             && !cfg_binding_differs(&member.cfg, &leader_cfg)
@@ -1286,6 +1370,7 @@ impl WatchRegistry {
         for (id, reg) in &guard.regs {
             if id.source != *source
                 || !names.contains(reg.corpus.name.as_str())
+                || reg.retirement_due
                 || reg.reconciled_once
                 || reg.last_error.is_some()
             {
@@ -1398,6 +1483,7 @@ mod tests {
             canonical_watched: PathBuf::from(watched),
             corpus,
             canonical_file_root: None,
+            resolution: RootResolution::Resolved,
             mode: notify::RecursiveMode::Recursive,
         }
     }
@@ -1984,10 +2070,15 @@ mod tests {
     }
 
     #[test]
-    fn pending_cleanups_are_bounded_and_drop_the_oldest() {
+    fn pending_cleanups_retain_every_admitted_registration() {
         let registry = WatchRegistry::new();
         let cfg = Arc::new(Config::default());
-        for index in 0..=MAX_PENDING_CLEANUPS {
+        for index in 0..MAX_PENDING_CLEANUPS {
+            let permit = registry
+                .cleanup_slots
+                .clone()
+                .try_acquire_owned()
+                .expect("cleanup slot");
             registry.park_failed_cleanup(RetiredRegistration {
                 corpus: format!("c{index}"),
                 root: PathBuf::from("/gone"),
@@ -1995,12 +2086,17 @@ mod tests {
                 lock_keys: Vec::new(),
                 cfg: cfg.clone(),
                 failed_attempts: 0,
+                _permit: permit,
             });
         }
+        assert!(registry.cleanup_slots.clone().try_acquire_owned().is_err());
         let pending = registry.take_pending_cleanups();
         assert_eq!(pending.len(), MAX_PENDING_CLEANUPS);
-        assert_eq!(pending[0].corpus, "c1");
+        assert_eq!(pending[0].corpus, "c0");
+        assert_eq!(pending[MAX_PENDING_CLEANUPS - 1].corpus, "c63");
         assert!(registry.take_pending_cleanups().is_empty());
+        drop(pending);
+        assert!(registry.cleanup_slots.clone().try_acquire_owned().is_ok());
     }
 
     #[test]
@@ -2515,8 +2611,18 @@ mod tests {
     fn refresh_roots_rekeys_registration_when_canonical_root_changes() {
         let registry = WatchRegistry::new();
         let cfg = Arc::new(Config::default());
-        registry.register(ConfigSource::Baseline, corpus("wiki"), cfg, vec![]);
-        let old_id = baseline_id("wiki");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut selected = corpus("wiki");
+        let configured = temp.path().join("absent");
+        selected.paths = vec![configured.to_string_lossy().into_owned()];
+        registry.register(ConfigSource::Baseline, selected, cfg, vec![]);
+        let old_id = RegistrationId {
+            source: ConfigSource::Baseline,
+            corpus_key: CorpusKey {
+                name: "wiki".into(),
+                canonical_root: configured,
+            },
+        };
         registry.record_pending(&old_id, [PathBuf::from("/a/changed.md")]);
 
         registry.refresh_roots(|c| vec![root("/newly/resolved", c.clone())]);
@@ -2727,6 +2833,169 @@ mod tests {
             Some(PendingWork::FullRoot),
             "the still-present registration must remain untouched"
         );
+    }
+
+    #[test]
+    fn config_replacement_defers_excess_retirements_without_losing_them() {
+        let registry = WatchRegistry::new();
+        let cfg = Arc::new(Config::default());
+        let source = ConfigSource::RepoLayer(PathBuf::from("/repo"));
+        let corpora: Vec<_> = (0..=MAX_PENDING_CLEANUPS)
+            .map(|index| corpus(&format!("c{index}")))
+            .collect();
+        registry
+            .replace_source(source.clone(), corpora, cfg.clone(), |_| vec![])
+            .expect("register");
+
+        let retired = registry
+            .replace_source(source.clone(), vec![], cfg.clone(), |_| vec![])
+            .expect("first replacement");
+        assert_eq!(retired.len(), MAX_PENDING_CLEANUPS);
+        assert_eq!(registry.repo_layer_sources(), vec![PathBuf::from("/repo")]);
+        let blocked = registry
+            .replace_source(source.clone(), vec![], cfg.clone(), |_| vec![])
+            .expect("blocked replacement");
+        assert!(
+            blocked.is_empty(),
+            "held cleanup permits must defer retirement"
+        );
+        drop(retired);
+        let last = registry.drain_deferred_retirements();
+        assert_eq!(
+            last.len(),
+            1,
+            "the omitted registration must retire on retry"
+        );
+        assert!(registry.repo_layer_sources().is_empty());
+        assert!(registry.drain_deferred_retirements().is_empty());
+    }
+
+    #[test]
+    fn rediscovery_keeps_an_obsolete_deferred_cleanup() {
+        let registry = WatchRegistry::new();
+        let cfg = Arc::new(Config::default());
+        let source = ConfigSource::RepoLayer(PathBuf::from("/repo"));
+        let selected = corpus("wiki");
+        let old_root = root("/old", selected.clone());
+        registry.register(
+            source.clone(),
+            selected.clone(),
+            cfg.clone(),
+            vec![old_root],
+        );
+        let held: Vec<_> = (0..MAX_PENDING_CLEANUPS)
+            .map(|_| {
+                registry
+                    .cleanup_slots
+                    .clone()
+                    .try_acquire_owned()
+                    .expect("cleanup slot")
+            })
+            .collect();
+        assert!(
+            registry
+                .replace_source(source.clone(), vec![], cfg.clone(), |_| vec![])
+                .expect("defer old root")
+                .is_empty()
+        );
+        assert!(
+            registry.snapshot_roots().is_empty(),
+            "a deferred removal must stop watching"
+        );
+        assert_eq!(
+            registry.begin_next_catch_up(1),
+            None,
+            "a deferred removal must not reindex"
+        );
+
+        let outcome = registry.register(
+            source.clone(),
+            selected.clone(),
+            cfg,
+            vec![root("/new", selected)],
+        );
+        assert_eq!(outcome, RegisterOutcome::New);
+        drop(held);
+        let retired = registry.drain_deferred_retirements();
+        assert_eq!(
+            retired.len(),
+            1,
+            "rediscovery must not erase the old cleanup"
+        );
+        assert_eq!(retired[0].roots[0], PathBuf::from("/old"));
+        assert_eq!(
+            registry.snapshot_roots().len(),
+            1,
+            "the new root must stay watched"
+        );
+    }
+
+    #[test]
+    fn same_id_rediscovery_revives_a_deferred_registration() {
+        let registry = WatchRegistry::new();
+        let cfg = Arc::new(Config::default());
+        let source = ConfigSource::RepoLayer(PathBuf::from("/repo"));
+        registry.register(source.clone(), corpus("wiki"), cfg.clone(), vec![]);
+        let held: Vec<_> = (0..MAX_PENDING_CLEANUPS)
+            .map(|_| {
+                registry
+                    .cleanup_slots
+                    .clone()
+                    .try_acquire_owned()
+                    .expect("cleanup slot")
+            })
+            .collect();
+        assert!(
+            registry
+                .replace_source(source.clone(), vec![], cfg.clone(), |_| vec![])
+                .expect("defer root")
+                .is_empty()
+        );
+        assert_eq!(registry.begin_next_catch_up(1), None);
+        let outcome = registry.register(source, corpus("wiki"), cfg, vec![]);
+        assert_eq!(
+            outcome,
+            RegisterOutcome::New,
+            "rediscovery must queue a fresh pass"
+        );
+        assert_eq!(
+            registry.begin_next_catch_up(1),
+            Some(RegistrationId {
+                source: ConfigSource::RepoLayer(PathBuf::from("/repo")),
+                corpus_key: CorpusKey {
+                    name: "wiki".into(),
+                    canonical_root: PathBuf::new()
+                }
+            })
+        );
+        drop(held);
+        assert!(
+            registry.drain_deferred_retirements().is_empty(),
+            "revived root must not retire"
+        );
+    }
+
+    #[test]
+    fn missing_root_retirement_defers_excess_without_dropping_registrations() {
+        let registry = WatchRegistry::new();
+        let cfg = Arc::new(Config::default());
+        let mut absent = HashSet::new();
+        for index in 0..=MAX_PENDING_CLEANUPS {
+            let name = format!("c{index}");
+            registry.register(ConfigSource::Baseline, corpus(&name), cfg.clone(), vec![]);
+            absent.insert(baseline_id(&name));
+        }
+        let retired = registry.record_absent_roots(&absent, 1);
+        assert_eq!(retired.len(), MAX_PENDING_CLEANUPS);
+        assert!(registry.record_absent_roots(&absent, 1).is_empty());
+        drop(retired);
+        let last = registry.record_absent_roots(&absent, 1);
+        assert_eq!(
+            last.len(),
+            1,
+            "the deferred registration must retire on a later tick"
+        );
+        assert!(registry.root_probes().is_empty());
     }
 
     #[test]

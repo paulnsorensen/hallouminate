@@ -1,3 +1,4 @@
+use std::io;
 use std::path::{Path, PathBuf};
 
 use super::FileRef;
@@ -90,11 +91,27 @@ pub fn canonical_following_leaf(path: &Path) -> PathBuf {
 
 /// A root confirmed absent from the filesystem via `io::ErrorKind::NotFound`
 /// -- the entire safety proof `LanceStore::delete_root` accepts. Constructible
-/// only through `retired_roots`, so a caller cannot pass an unverified path.
+/// only through `RetiredRoot::probe` or `retired_roots`, so a caller cannot pass an unverified path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetiredRoot(PathBuf);
 
 impl RetiredRoot {
+    /// Probes one storage key and returns a retired root only for `NotFound`.
+    /// Returns `None` when the storage key exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns the filesystem error when the root's presence is indeterminate.
+    pub fn probe(path: &Path) -> io::Result<Option<Self>> {
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => Ok(None),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                Ok(Some(Self(path.to_path_buf())))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     pub fn as_path(&self) -> &Path {
         &self.0
     }
@@ -109,28 +126,22 @@ impl RetiredRoot {
 /// and is NOT retired -- fail closed, since the deletion this gates is
 /// irreversible and machine-wide.
 pub fn retired_roots(known: &[PathBuf]) -> Vec<RetiredRoot> {
-    known
-        .iter()
-        .filter(|root| match std::fs::symlink_metadata(root) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
-            Err(e) => {
-                // Not retired -- fail closed -- but a root that is
-                // permanently unstat-able (bad permissions, a persistently
-                // stale mount) would otherwise never be collected AND never
-                // be reported, silently under-delivering GC forever.
+    let mut retired = Vec::new();
+    for root in known {
+        match RetiredRoot::probe(root) {
+            Ok(Some(root)) => retired.push(root),
+            Ok(None) => {}
+            Err(error) => {
                 tracing::warn!(
                     target: "hallouminate::lance",
                     root = %root.display(),
-                    error = %e,
+                    error = %error,
                     "root's filesystem status could not be determined; not retiring it",
                 );
-                false
             }
-            Ok(_) => false,
-        })
-        .cloned()
-        .map(RetiredRoot)
-        .collect()
+        }
+    }
+    retired
 }
 
 #[cfg(test)]

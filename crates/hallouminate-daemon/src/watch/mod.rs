@@ -58,6 +58,12 @@ type NativeWatcher = notify::RecommendedWatcher;
 
 type NativeDebouncer = notify_debouncer_full::Debouncer<NativeWatcher, NoCache>;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RootResolution {
+    Resolved,
+    Unresolved,
+}
+
 /// One watched location: the directory handed to `notify`, the corpus that
 /// owns it, and — for a **file-path** corpus root — the exact declared file.
 /// A file-path corpus root (e.g. `~/.claude/CLAUDE.md`) is watched at its
@@ -86,6 +92,7 @@ pub(crate) struct WatchRoot {
     canonical_watched: PathBuf,
     corpus: CorpusConfig,
     canonical_file_root: Option<PathBuf>,
+    resolution: RootResolution,
     /// Recursion mode handed to `notify`. A directory root watches its whole
     /// subtree (`Recursive`); a file-path root watches only its parent dir's
     /// direct entries (`NonRecursive`) — enough to catch edits and the
@@ -387,6 +394,9 @@ fn run_reconcile_tick(
     tracker: &TaskTracker,
     reload_failures: &mut ReloadFailureMemo,
 ) {
+    for registration in state.watch_registry().drain_deferred_retirements() {
+        spawn_retired_cleanup(state, tracker, registration);
+    }
     retire_missing_registrations(state, tracker);
     for registration in state.watch_registry().take_pending_cleanups() {
         spawn_retired_cleanup(state, tracker, registration);
@@ -463,17 +473,27 @@ fn spawn_retired_cleanup(
     });
 }
 
-/// Deletes the storage rows of every retired watch root that is still
-/// absent. Returns the registration narrowed to the roots whose cleanup
-/// failed, so the caller can retry it, or `None` when nothing remains.
-/// A root that reappeared is dropped, not deleted.
-///
-/// Clear the debt gate before taking the corpus lock and write lane.
-/// Recheck absence under both locks so cleanup cannot race catch-up.
+/// Deletes rows for retired roots that remain absent after resource setup.
+/// Returns only roots that need another cleanup attempt.
 async fn cleanup_retired_registration(
     state: &DaemonState,
     registration: registry::RetiredRegistration,
 ) -> Option<registry::RetiredRegistration> {
+    let loud = registration.warns_on_failure();
+    let resources = match state.resources_for(&registration.cfg).await {
+        Ok(resources) => resources,
+        Err(error) => {
+            if loud {
+                tracing::warn!(target: "hallouminate::daemon", corpus = %registration.corpus, error = %error, "watcher: retired-root storage access failed; will retry on next reconcile");
+            } else {
+                tracing::debug!(target: "hallouminate::daemon", corpus = %registration.corpus, error = %error, "watcher: retired-root storage access failed; will retry on next reconcile");
+            }
+            return Some(registry::RetiredRegistration {
+                failed_attempts: registration.failed_attempts.saturating_add(1),
+                ..registration
+            });
+        }
+    };
     let shutdown = state.shutdown_token().clone();
     let _guard = tokio::select! {
         biased;
@@ -488,37 +508,32 @@ async fn cleanup_retired_registration(
         },
     };
     let mut failed = Vec::new();
-    let loud = registration.warns_on_failure();
-    for path in &registration.roots {
+    for retired in &registration.roots {
+        let path = retired;
         let probe = path.clone();
-        let root = match tokio::task::spawn_blocking(move || {
-            hallouminate_domain::common::retired_roots(std::slice::from_ref(&probe))
-                .into_iter()
-                .next()
+        let checked = tokio::task::spawn_blocking(move || {
+            hallouminate_domain::common::RetiredRoot::probe(&probe)
         })
-        .await
-        {
-            Ok(Some(root)) => root,
-            Ok(None) => continue,
+        .await;
+        let root = match checked {
+            Ok(Ok(Some(root))) => root,
+            Ok(Ok(None)) => continue,
+            Ok(Err(error)) => {
+                if loud {
+                    tracing::warn!(target: "hallouminate::daemon", root = %path.display(), error = %error, "watcher: retired-root check failed; will retry on next reconcile");
+                } else {
+                    tracing::debug!(target: "hallouminate::daemon", root = %path.display(), error = %error, "watcher: retired-root check failed; will retry on next reconcile");
+                }
+                failed.push(retired.clone());
+                continue;
+            }
             Err(error) => {
                 if loud {
                     tracing::warn!(target: "hallouminate::daemon", root = %path.display(), error = %error, "watcher: retired-root check failed; will retry on next reconcile");
                 } else {
                     tracing::debug!(target: "hallouminate::daemon", root = %path.display(), error = %error, "watcher: retired-root check failed; will retry on next reconcile");
                 }
-                failed.push(path.clone());
-                continue;
-            }
-        };
-        let resources = match state.resources_for(&registration.cfg).await {
-            Ok(resources) => resources,
-            Err(error) => {
-                if loud {
-                    tracing::warn!(target: "hallouminate::daemon", root = %path.display(), error = %error, "watcher: retired-root storage access failed; will retry on next reconcile");
-                } else {
-                    tracing::debug!(target: "hallouminate::daemon", root = %path.display(), error = %error, "watcher: retired-root storage access failed; will retry on next reconcile");
-                }
-                failed.push(path.clone());
+                failed.push(retired.clone());
                 continue;
             }
         };
@@ -532,7 +547,7 @@ async fn cleanup_retired_registration(
                 } else {
                     tracing::debug!(target: "hallouminate::daemon", root = %path.display(), error = %error, "watcher: retired-root cleanup failed; will retry on next reconcile");
                 }
-                failed.push(path.clone());
+                failed.push(retired.clone());
             }
         }
     }
@@ -1600,32 +1615,37 @@ fn record_pending(
 /// Retains a not-yet-created root so recovery can install it when it appears.
 fn build_watch_root(corpus: &CorpusConfig, raw: &str) -> Option<WatchRoot> {
     let root = expand_tilde(raw);
+    let (canonical_root, resolution) = match root.canonicalize() {
+        Ok(canonical) => (canonical, RootResolution::Resolved),
+        Err(_) => (root.clone(), RootResolution::Unresolved),
+    };
     if root.is_dir() {
-        let canonical_watched = canonicalize_or_passthrough(&root).into_path_buf();
         Some(WatchRoot {
             watched: root,
-            canonical_watched,
+            canonical_watched: canonical_root,
             corpus: corpus.clone(),
             canonical_file_root: None,
+            resolution,
             mode: RecursiveMode::Recursive,
         })
     } else if root.is_file() {
         let parent = root.parent()?.to_path_buf();
         let canonical_watched = canonicalize_or_passthrough(&parent).into_path_buf();
-        let canonical_file_root = Some(canonicalize_or_passthrough(&root).into_path_buf());
         Some(WatchRoot {
             watched: parent,
             canonical_watched,
             corpus: corpus.clone(),
-            canonical_file_root,
+            canonical_file_root: Some(canonical_root),
+            resolution,
             mode: RecursiveMode::NonRecursive,
         })
     } else {
         Some(WatchRoot {
-            canonical_watched: canonicalize_or_passthrough(&root).into_path_buf(),
+            canonical_watched: canonical_root,
             watched: root,
             corpus: corpus.clone(),
             canonical_file_root: None,
+            resolution,
             mode: RecursiveMode::Recursive,
         })
     }
@@ -2059,6 +2079,7 @@ mod tests {
             canonical_watched: PathBuf::from(watched),
             corpus,
             canonical_file_root: file_root.map(PathBuf::from),
+            resolution: RootResolution::Resolved,
             mode,
         }
     }
@@ -2247,6 +2268,7 @@ mod tests {
             canonical_watched: PathBuf::from("/real/wiki"),
             corpus: corpus("wiki", "/link/wiki", &["**/*.md"]),
             canonical_file_root: None,
+            resolution: RootResolution::Resolved,
             mode: RecursiveMode::Recursive,
         };
         let deleted = Path::new("/real/wiki/topics/spice.md");
@@ -2270,6 +2292,7 @@ mod tests {
             canonical_watched: PathBuf::from("/private/var/tmp/wiki"),
             corpus: corpus("wiki", "/var/tmp/wiki", &["**/*.md"]),
             canonical_file_root: None,
+            resolution: RootResolution::Resolved,
             mode: RecursiveMode::Recursive,
         };
         let roots = [root];
@@ -2291,6 +2314,7 @@ mod tests {
             canonical_watched: PathBuf::from("/a"),
             corpus: corpus("plain", "/a", &["**/*.md"]),
             canonical_file_root: None,
+            resolution: RootResolution::Resolved,
             mode: RecursiveMode::Recursive,
         };
         let linked = WatchRoot {
@@ -2298,6 +2322,7 @@ mod tests {
             canonical_watched: PathBuf::from("/b/real"),
             corpus: corpus("linked", "/a/link", &["**/*.md"]),
             canonical_file_root: None,
+            resolution: RootResolution::Resolved,
             mode: RecursiveMode::Recursive,
         };
         assert_eq!(
@@ -2314,6 +2339,7 @@ mod tests {
             canonical_watched: PathBuf::from("/real/wiki"),
             corpus: corpus("wiki", "/link/wiki", &["**/*.md"]),
             canonical_file_root: None,
+            resolution: RootResolution::Resolved,
             mode: RecursiveMode::Recursive,
         };
         let roots = vec![owner];
@@ -5984,6 +6010,268 @@ body
     }
 
     #[tokio::test]
+    async fn retired_root_recreated_during_resource_setup_keeps_all_corpora() {
+        use hallouminate_domain::search::ChunkRetrieval;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (state, repo, root) = repo_layer_fixture(tmp.path()).await;
+        std::fs::write(root.join("note.md"), "# Note\n\nbody\n").expect("write root file");
+        let cfg = state.baseline().clone();
+        let resources = state.resources_for(&cfg).await.expect("resources");
+        let first = CorpusKey::from_configured_root("cheese", root.to_str().expect("utf8"));
+        let second = CorpusKey::from_configured_root("other", root.to_str().expect("utf8"));
+        for key in [&first, &second] {
+            seed_retired_root_rows(&resources.store, key).await;
+            let hits = resources
+                .store
+                .retrieve_signals(key, "body", 10)
+                .await
+                .expect("search seed");
+            assert_eq!(hits.fts.len(), 1, "seed must be searchable in {key:?}");
+            assert_eq!(
+                hits.hits[&hits.fts[0]].file_ref,
+                root.join("note.md").to_string_lossy()
+            );
+        }
+        let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+        let resume = std::sync::Arc::new(tokio::sync::Notify::new());
+        state.pause_next_resource_lookup(entered.clone(), resume.clone());
+        std::fs::remove_dir_all(&repo).expect("remove repo and root");
+        let tracker = TaskTracker::new();
+        for _ in 0..MISSING_ROOT_RETIRE_TICKS {
+            retire_missing_registrations(&state, &tracker);
+        }
+        assert!(!registered(&state, "cheese"), "registration must retire");
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("retired cleanup did not request resources");
+        std::fs::create_dir_all(&root).expect("recreate root");
+        std::fs::write(root.join("note.md"), "# Note\n\nbody\n").expect("recreate root file");
+        let unrelated_root = tmp.path().join("unrelated");
+        let unrelated =
+            CorpusKey::from_configured_root("unrelated", unrelated_root.to_str().expect("utf8"));
+        let write = tokio::time::timeout(Duration::from_secs(2), async {
+            let _guard = state
+                .acquire_mutation_guard(std::slice::from_ref(&unrelated))
+                .await
+                .expect("unrelated mutation admission");
+            seed_retired_root_rows(&resources.store, &unrelated).await;
+        })
+        .await;
+        resume.notify_one();
+        tracker.close();
+        tracker.wait().await;
+        for key in [&first, &second] {
+            let hits = resources
+                .store
+                .retrieve_signals(key, "body", 10)
+                .await
+                .expect("search retained rows");
+            assert_eq!(
+                hits.fts.len(),
+                1,
+                "returning root must keep searchable rows in {key:?}"
+            );
+            assert_eq!(
+                hits.hits[&hits.fts[0]].file_ref,
+                root.join("note.md").to_string_lossy()
+            );
+        }
+        assert!(
+            write.is_ok(),
+            "unrelated store write must complete while resources wait"
+        );
+        let hits = resources
+            .store
+            .retrieve_signals(&unrelated, "body", 10)
+            .await
+            .expect("search unrelated write");
+        assert!(!hits.fts.is_empty(), "unrelated write must be searchable");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn vanished_symlink_ancestor_keeps_the_canonical_retirement_key() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (state, _repo, _root) = repo_layer_fixture(tmp.path()).await;
+        let physical = tmp.path().join("physical");
+        let root = physical.join("watched");
+        std::fs::create_dir_all(&root).expect("create physical root");
+        std::fs::write(root.join("note.md"), "# Note\n\nbody\n").expect("write watched note");
+        let alias_parent = tmp.path().join("alias-parent");
+        std::fs::create_dir_all(&alias_parent).expect("create alias parent");
+        symlink(&physical, alias_parent.join("linked")).expect("link physical root");
+        let alias = alias_parent.join("linked/watched");
+        let selected = corpus("alias", alias.to_str().expect("utf8"), &["**/*.md"]);
+        let cfg = state.baseline().clone();
+        let source = registry::ConfigSource::RepoLayer(tmp.path().join("alias-config.toml"));
+        state.watch_registry().register(
+            source.clone(),
+            selected.clone(),
+            std::sync::Arc::new(cfg.clone()),
+            watch_roots_for(&selected),
+        );
+        let (before, _) = state
+            .watch_registry()
+            .snapshot_roots()
+            .into_iter()
+            .find(|(id, _)| id.corpus_key.name == "alias")
+            .expect("alias registration");
+        assert_eq!(before.corpus_key.canonical_root, root);
+        let resources = state.resources_for(&cfg).await.expect("resources");
+        seed_retired_root_rows(&resources.store, &before.corpus_key).await;
+
+        std::fs::remove_dir_all(&alias_parent).expect("remove symlink ancestor");
+        state.watch_registry().refresh_roots(watch_roots_for);
+        let (after, _) = state
+            .watch_registry()
+            .snapshot_roots()
+            .into_iter()
+            .find(|(id, _)| id.corpus_key.name == "alias")
+            .expect("alias registration after refresh");
+        assert_eq!(
+            after.corpus_key, before.corpus_key,
+            "missing alias must not rekey stored rows"
+        );
+        std::fs::remove_dir_all(&physical).expect("remove physical root");
+        let mut retired = state
+            .watch_registry()
+            .replace_source(source, vec![], std::sync::Arc::new(cfg), watch_roots_for)
+            .expect("replace source");
+        assert_eq!(retired.len(), 1);
+        assert_eq!(retired[0].roots[0], root);
+        assert!(
+            cleanup_retired_registration(&state, retired.pop().expect("retired alias"))
+                .await
+                .is_none()
+        );
+        let stats = resources
+            .store
+            .corpus_chunk_stats(&before.corpus_key)
+            .await
+            .expect("stats");
+        assert_eq!(
+            stats.total_chunks, 0,
+            "retirement must delete rows under the original canonical key"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retargeted_alias_does_not_keep_old_canonical_rows() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (state, _repo, _root) = repo_layer_fixture(tmp.path()).await;
+        let old_physical = tmp.path().join("old-physical");
+        let old_root = old_physical.join("watched");
+        let new_physical = tmp.path().join("new-physical");
+        std::fs::create_dir_all(&old_root).expect("create old root");
+        std::fs::create_dir_all(new_physical.join("watched")).expect("create new root");
+        let alias_link = tmp.path().join("linked");
+        symlink(&old_physical, &alias_link).expect("link old root");
+        let alias = alias_link.join("watched");
+        let selected = corpus("alias", alias.to_str().expect("utf8"), &["**/*.md"]);
+        let cfg = state.baseline().clone();
+        let source = registry::ConfigSource::RepoLayer(tmp.path().join("alias-config.toml"));
+        state.watch_registry().register(
+            source.clone(),
+            selected.clone(),
+            std::sync::Arc::new(cfg.clone()),
+            watch_roots_for(&selected),
+        );
+        let (before, _) = state
+            .watch_registry()
+            .snapshot_roots()
+            .into_iter()
+            .find(|(id, _)| id.corpus_key.name == "alias")
+            .expect("alias registration");
+        assert_eq!(before.corpus_key.canonical_root, old_root);
+        let resources = state.resources_for(&cfg).await.expect("resources");
+        seed_retired_root_rows(&resources.store, &before.corpus_key).await;
+
+        std::fs::remove_file(&alias_link).expect("unlink old alias");
+        symlink(&new_physical, &alias_link).expect("retarget alias");
+        std::fs::remove_dir_all(&old_physical).expect("remove old root");
+        let mut retired = state
+            .watch_registry()
+            .replace_source(source, vec![], std::sync::Arc::new(cfg), watch_roots_for)
+            .expect("replace source");
+        assert_eq!(retired.len(), 1);
+        assert_eq!(retired[0].roots[0], old_root);
+        assert!(
+            cleanup_retired_registration(&state, retired.pop().expect("retired alias"))
+                .await
+                .is_none()
+        );
+        let stats = resources
+            .store
+            .corpus_chunk_stats(&before.corpus_key)
+            .await
+            .expect("stats");
+        assert_eq!(
+            stats.total_chunks, 0,
+            "retargeted alias must not keep old rows"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn indeterminate_root_stat_retries_config_replacement_cleanup() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (state, _repo, _root) = repo_layer_fixture(tmp.path()).await;
+        let loop_path = tmp.path().join("loop");
+        symlink(&loop_path, &loop_path).expect("create symlink loop");
+        let root = loop_path.join("child");
+        let selected = corpus("loop", root.to_str().expect("utf8"), &["**/*.md"]);
+        let cfg = state.baseline().clone();
+        let source = registry::ConfigSource::RepoLayer(tmp.path().join("loop-config.toml"));
+        state.watch_registry().register(
+            source.clone(),
+            selected.clone(),
+            std::sync::Arc::new(cfg.clone()),
+            watch_roots_for(&selected),
+        );
+        let key = CorpusKey::from_configured_root("loop", root.to_str().expect("utf8"));
+        let resources = state.resources_for(&cfg).await.expect("resources");
+        seed_retired_root_rows(&resources.store, &key).await;
+        let mut retired = state
+            .watch_registry()
+            .replace_source(source, vec![], std::sync::Arc::new(cfg), watch_roots_for)
+            .expect("replace source");
+        assert_eq!(retired.len(), 1);
+        let pending = cleanup_retired_registration(&state, retired.pop().expect("retired loop"))
+            .await
+            .expect("indeterminate stat must retry");
+        let stats = resources
+            .store
+            .corpus_chunk_stats(&key)
+            .await
+            .expect("stats");
+        assert_eq!(stats.total_chunks, 1, "indeterminate stat must retain rows");
+
+        std::fs::remove_file(&loop_path).expect("remove symlink loop");
+        assert!(
+            cleanup_retired_registration(&state, pending)
+                .await
+                .is_none()
+        );
+        let stats = resources
+            .store
+            .corpus_chunk_stats(&key)
+            .await
+            .expect("stats");
+        assert_eq!(
+            stats.total_chunks, 0,
+            "a later NotFound proof must delete rows"
+        );
+    }
+
+    #[tokio::test]
     async fn retired_root_cleanup_waits_for_mutation_admission() {
         use crate::debt::{DebtLevel, OBSERVED, OBSERVED_HARD_COORD};
 
@@ -6010,6 +6298,9 @@ body
             lock_keys: vec![key.clone()],
             cfg: std::sync::Arc::new(cfg),
             failed_attempts: 0,
+            _permit: std::sync::Arc::new(tokio::sync::Semaphore::new(1))
+                .try_acquire_owned()
+                .expect("cleanup slot"),
         };
 
         let pending = cleanup_retired_registration(&state, retired).await;
@@ -6024,13 +6315,17 @@ body
             "Hard debt must preserve the indexed row"
         );
         let pending = pending.expect("Hard debt must defer cleanup");
-        assert_eq!(pending.roots, vec![root]);
+        assert_eq!(pending.roots[0], root);
     }
 
     async fn seed_retired_root_rows(store: &LanceStore, key: &CorpusKey) {
         store
             .apply_batch(vec![hallouminate_domain::indexer::PreparedFile {
-                file_ref: "/tmp/gone.md".into(),
+                file_ref: key
+                    .canonical_root
+                    .join("note.md")
+                    .to_string_lossy()
+                    .into_owned(),
                 corpus_key: key.clone(),
                 mtime_ms: 1,
                 content_hash: "deadbeef".into(),
@@ -6071,12 +6366,15 @@ body
             lock_keys: Vec::new(),
             cfg: std::sync::Arc::clone(&broken),
             failed_attempts: 0,
+            _permit: std::sync::Arc::new(tokio::sync::Semaphore::new(1))
+                .try_acquire_owned()
+                .expect("cleanup slot"),
         };
 
         let failed = cleanup_retired_registration(&state, retired)
             .await
             .expect("cleanup against unusable storage must report retry work");
-        assert_eq!(failed.roots, vec![tmp.path().join("gone")]);
+        assert_eq!(failed.roots[0], tmp.path().join("gone"));
         state.watch_registry().park_failed_cleanup(failed);
 
         std::fs::remove_file(&blocker).expect("remove blocker");
