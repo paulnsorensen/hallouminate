@@ -85,10 +85,7 @@ pub async fn ensure_daemon_running() -> anyhow::Result<()> {
         std::fs::create_dir_all(dir)?;
     }
     truncate_log_if_oversized(&log_path, MAX_BOOTSTRAP_LOG_BYTES)?;
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)?;
+    let log = open_bootstrap_capture(&log_path)?;
     let log_err = log.try_clone()?;
 
     let exe = std::env::current_exe()?;
@@ -165,6 +162,17 @@ fn has_explicit_socket_override(env_value: Option<&std::ffi::OsStr>) -> bool {
     env_value.is_some_and(|v| !v.is_empty())
 }
 
+fn open_bootstrap_capture(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
 /// Caps `daemon-bootstrap.log` at `max_bytes` before the next append. Called
 /// once per `ensure_daemon_running` invocation, right before the log is
 /// (re)opened in append mode, so a log that grew past the cap on a prior
@@ -172,7 +180,11 @@ fn has_explicit_socket_override(env_value: Option<&std::ffi::OsStr>) -> bool {
 /// A missing file (first run) is not an error.
 fn truncate_log_if_oversized(path: &Path, max_bytes: u64) -> std::io::Result<()> {
     match std::fs::metadata(path) {
-        Ok(meta) if meta.len() > max_bytes => std::fs::File::create(path).map(|_| ()),
+        Ok(meta) if meta.len() > max_bytes => std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(path)
+            .map(|_| ()),
         Ok(_) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
@@ -308,6 +320,23 @@ fn skew_verdict(ours: &str, resp: &DaemonResponse) -> SkewVerdict {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn new_bootstrap_capture_is_owner_only() -> std::io::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("daemon-bootstrap.log");
+        open_bootstrap_capture(&path)?;
+        let mode = std::fs::metadata(&path)?.permissions().mode();
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "bootstrap capture permits group or other access"
+        );
+        Ok(())
+    }
 
     #[test]
     fn unset_socket_env_does_not_bypass_spawn() {

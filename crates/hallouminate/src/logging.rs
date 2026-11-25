@@ -8,11 +8,12 @@
 //!
 //! A file rotates when the next record would exceed `max_file_bytes`. Archives
 //! use `<name>.log.1`, `.2`, and so on, with the highest number newest.
+//! Oversized records are dropped. New log files are owner-only on Unix.
 //! `max_total_bytes` bounds all hallouminate log files in the directory
 //! together, including legacy `hallouminate.log` files. At startup and after
-//! each rotation, the oldest files of dead processes go first, then the oldest
-//! archives of the rotating process. The active file and archives of a live
-//! process are never deleted by another process.
+//! each rotation, oversized removable archives go first, then other eligible
+//! files oldest-first. A stable per-directory lock serializes retention passes.
+//! Another live process's files are never deleted.
 //!
 //! Each writer holds an exclusive advisory lock on `<name>.log.lock` while it
 //! runs. A cleaner that takes this lock without blocking has proof that the
@@ -27,7 +28,7 @@
 //! hook so stderr output stays.
 //!
 //! The returned [`LogGuard`] must be held while logging is active. Dropping it
-//! drains queued records, then closes the file and releases its lock.
+//! attempts a bounded flush, then closes the file and releases its lock.
 //!
 //! Filter precedence: `HALLOUMINATE_LOG` env var → `RUST_LOG` → default
 //! `hallouminate=info`. Use the same syntax as `RUST_LOG`
@@ -59,6 +60,7 @@ const LOCK_RETRY_DELAY: Duration = Duration::from_millis(10);
 const CLI_FAMILY_PREFIX: &str = "cli-";
 const MAX_CLI_FAMILIES: usize = 32;
 const OPEN_RETRY_DELAY: Duration = Duration::from_secs(5);
+const RETENTION_LOCK: &str = ".log-retention";
 
 /// The kind of hallouminate process, which selects its log file name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,8 +76,8 @@ pub enum LogRole {
 
 /// Keeps the background log writer alive.
 ///
-/// Dropping the guard drains and flushes queued records, then closes the log
-/// file and releases its owner lock.
+/// Dropping the guard attempts a bounded flush of queued records, then closes
+/// the log file and releases its owner lock.
 pub struct LogGuard {
     worker: Option<WorkerGuard>,
     slot: Arc<Mutex<Slot>>,
@@ -84,7 +86,13 @@ pub struct LogGuard {
 impl Drop for LogGuard {
     fn drop(&mut self) {
         drop(self.worker.take());
-        *lock_slot(&self.slot) = Slot::Closed;
+        match self.slot.try_lock() {
+            Ok(mut slot) => *slot = Slot::Closed,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                *poisoned.into_inner() = Slot::Closed;
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {}
+        }
     }
 }
 
@@ -171,9 +179,8 @@ fn log_writer(
         config: *config,
         slot: Arc::clone(&slot),
     };
-    // Stay lossy (the crate default): the async daemon must not block a tokio
-    // worker on a full log buffer. Flush-on-exit is guaranteed by `LogGuard`
-    // drop, not by non-lossy mode.
+    // Stay lossy so a full log buffer does not block a tokio worker.
+    // WorkerGuard attempts a bounded flush when LogGuard drops.
     let (writer, worker) = NonBlockingBuilder::default().finish(sink);
     let guard = LogGuard {
         worker: Some(worker),
@@ -437,25 +444,53 @@ fn prune(
     own: Option<&LogFamily>,
     config: &hallouminate_config::LoggingConfig,
 ) -> io::Result<()> {
+    if list_log_files(dir)?.is_empty() && list_lock_families(dir)?.is_empty() {
+        return Ok(());
+    }
+    let retention = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dir.join(RETENTION_LOCK))?;
+    retention.lock()?;
+
     let budget = config.max_total_bytes.saturating_sub(config.max_file_bytes);
     let mut owners = BTreeMap::new();
-    let mut files = list_log_files_with(dir, |family| {
+    let files = list_log_files_with(dir, |family| {
         if own != Some(family) {
             claim_owner(dir, family, &mut owners);
         }
     })?;
+    let mut first_error = None;
+    let mut eligible = Vec::new();
+    for file in files {
+        let archive = match file.kind {
+            LogFileKind::Archive(_) => true,
+            LogFileKind::Active => false,
+        };
+        let oversized_archive =
+            file.bytes > config.max_file_bytes && archive && is_removable(own, &file, &owners);
+        if oversized_archive {
+            if let Err(error) = remove_log_file(&file.path) {
+                keep_first(&mut first_error, error);
+                eligible.push(file);
+            }
+        } else {
+            eligible.push(file);
+        }
+    }
     let mut total: u64 = 0;
-    for file in &files {
+    for file in &eligible {
         total = total.saturating_add(file.bytes);
     }
-    files.sort_by(|a, b| {
+    eligible.sort_by(|a, b| {
         a.modified
             .cmp(&b.modified)
             .then_with(|| a.path.cmp(&b.path))
     });
-    let mut first_error = None;
     let mut remaining = Vec::new();
-    for file in files {
+    for file in eligible {
         if total <= budget || !is_removable(own, &file, &owners) {
             remaining.push(file);
             continue;
@@ -596,9 +631,15 @@ struct LogSink {
 
 impl Write for LogSink {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if u64::try_from(buf.len()).unwrap_or(u64::MAX) > self.config.max_file_bytes {
+            return Ok(buf.len());
+        }
         let mut slot = lock_slot(&self.slot);
         match *slot {
-            Slot::Failed { retry_at } if Instant::now() < retry_at => return write_stderr(buf),
+            Slot::Failed { retry_at } if Instant::now() < retry_at => {
+                drop(slot);
+                return write_stderr(buf);
+            }
             Slot::Failed { retry_at: _ } => *slot = Slot::Unopened,
             Slot::Unopened | Slot::Open(_) | Slot::Closed => {}
         }
@@ -606,10 +647,11 @@ impl Write for LogSink {
             Slot::Unopened => match ActiveLog::open(&self.dir, self.role, self.pid) {
                 Ok(active) => *slot = Slot::Open(active),
                 Err(error) => {
-                    report_once("open log file", &error);
                     *slot = Slot::Failed {
                         retry_at: Instant::now() + OPEN_RETRY_DELAY,
                     };
+                    drop(slot);
+                    report_once("open log file", &error);
                     return write_stderr(buf);
                 }
             },
@@ -622,15 +664,13 @@ impl Write for LogSink {
             }
             Slot::Closed => return Err(io::Error::other("log file is closed")),
         };
-        if u64::try_from(buf.len()).unwrap_or(u64::MAX) > self.config.max_file_bytes {
-            return write_stderr(buf);
-        }
         let record = active.write_record(&self.dir, &self.config, buf);
         if let Err(error) = record {
-            report_once("write log file", &error);
             *slot = Slot::Failed {
                 retry_at: Instant::now() + OPEN_RETRY_DELAY,
             };
+            drop(slot);
+            report_once("write log file", &error);
             return write_stderr(buf);
         }
         Ok(buf.len())
@@ -774,7 +814,14 @@ impl ActiveLog {
 }
 
 fn open_append(path: &Path) -> io::Result<File> {
-    OpenOptions::new().create(true).append(true).open(path)
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
 }
 
 fn reap_legacy_dated_logs(dir: &Path) -> std::io::Result<()> {
@@ -836,7 +883,7 @@ mod tests {
         let mut files = Vec::new();
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
-            if entry.file_type()?.is_file() {
+            if entry.file_type()?.is_file() && entry.file_name().to_str() != Some(RETENTION_LOCK) {
                 let path = entry.path();
                 let bytes = std::fs::read(&path)?;
                 files.push((path, bytes));
@@ -918,6 +965,105 @@ mod tests {
         let (files, lines) = family_lines(dir.path(), "cli-1")?;
         assert_eq!(files, 1);
         assert_eq!(lines, ["before", "after"]);
+        Ok(())
+    }
+
+    #[test]
+    fn lowered_file_limit_removes_oversized_dead_archives() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let archive = dir.path().join("cli-1.log.1");
+        std::fs::write(&archive, [b'x'; 128])?;
+        let config = LoggingConfig {
+            max_file_bytes: 64,
+            max_total_bytes: 1024,
+        };
+        prune(dir.path(), None, &config)?;
+        assert!(
+            !archive.exists(),
+            "oversized dead archive survived the lower cap"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_archive_is_removed_before_older_valid_files() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let valid = dir.path().join("cli-1.log");
+        let oversized = dir.path().join("cli-2.log.1");
+        let newer = dir.path().join("cli-3.log");
+        for (path, bytes, age) in [(&valid, 60, 1), (&oversized, 128, 2), (&newer, 60, 3)] {
+            std::fs::write(path, vec![b'x'; bytes])?;
+            File::options()
+                .write(true)
+                .open(path)?
+                .set_modified(UNIX_EPOCH + Duration::from_secs(age))?;
+        }
+        let config = LoggingConfig {
+            max_file_bytes: 64,
+            max_total_bytes: 184,
+        };
+        prune(dir.path(), None, &config)?;
+        assert!(!oversized.exists());
+        assert!(valid.exists(), "valid oldest file was over-deleted");
+        assert!(newer.exists(), "valid newest file was over-deleted");
+        Ok(())
+    }
+
+    #[test]
+    fn lowered_limit_preserves_another_live_family_archive() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let family = LogFamily("serve-7".to_owned());
+        let Claim::Acquired(lock) = FamilyLock::try_claim(dir.path(), &family)? else {
+            panic!("live family lock was not acquired");
+        };
+        let archive = family.archive_path(dir.path(), 1);
+        std::fs::write(&archive, [b'x'; 128])?;
+        let config = LoggingConfig {
+            max_file_bytes: 64,
+            max_total_bytes: 1024,
+        };
+        prune(dir.path(), None, &config)?;
+        assert!(archive.exists(), "another live archive was removed");
+        drop(lock);
+        Ok(())
+    }
+
+    #[test]
+    fn lowered_limit_rotates_existing_oversized_active_file() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let active = dir.path().join("cli-1.log");
+        std::fs::write(&active, [b'x'; 128])?;
+        let config = LoggingConfig {
+            max_file_bytes: 64,
+            max_total_bytes: 1024,
+        };
+        let (writer, guard) = log_writer(dir.path(), LogRole::Cli, 1, &config)?;
+        writer.make_writer().write_all(b"valid\n")?;
+        drop(writer);
+        drop(guard);
+        assert_eq!(std::fs::read_to_string(&active)?, "valid\n");
+        assert!(!dir.path().join("cli-1.log.1").exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_process_log_is_owner_only() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir()?;
+        let config = LoggingConfig {
+            max_file_bytes: 64,
+            max_total_bytes: 128,
+        };
+        let (writer, guard) = log_writer(dir.path(), LogRole::Cli, 1, &config)?;
+        writer.make_writer().write_all(b"private\n")?;
+        drop(writer);
+        drop(guard);
+        let mode = std::fs::metadata(dir.path().join("cli-1.log"))?
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o077, 0, "process log permits group or other access");
         Ok(())
     }
 
@@ -1138,6 +1284,45 @@ mod tests {
                 drop(lock);
                 Ok(())
             }
+            "oversize_burst" => {
+                let config = LoggingConfig {
+                    max_file_bytes: 256,
+                    max_total_bytes: 768,
+                };
+                let guard = install(&dir, LogRole::Daemon, std::process::id(), &config)?;
+                let payload = "x".repeat(128 * 1024);
+                for _ in 0..32 {
+                    tracing::info!(target: "hallouminate", "{payload}");
+                }
+                tracing::info!(target: "hallouminate", "valid-marker");
+                drop(guard);
+                Ok(())
+            }
+            #[cfg(target_os = "linux")]
+            "failed_write" => {
+                std::os::unix::fs::symlink(
+                    "/dev/full",
+                    dir.join(format!("cli-{}.log", std::process::id())),
+                )?;
+                let config = LoggingConfig {
+                    max_file_bytes: 2 << 20,
+                    max_total_bytes: 4 << 20,
+                };
+                let (writer, guard) = log_writer(&dir, LogRole::Cli, std::process::id(), &config)?;
+                writer.make_writer().write_all(&vec![b'x'; 1 << 20])?;
+                drop(writer);
+                drop(guard);
+                Ok(())
+            }
+            "prune" => {
+                std::fs::write(dir.join(format!("ready-{}", std::process::id())), b"")?;
+                let config = LoggingConfig {
+                    max_file_bytes: 64,
+                    max_total_bytes: 192,
+                };
+                prune(&dir, None, &config)?;
+                Ok(())
+            }
             other => anyhow::bail!("unknown child mode {other}"),
         }
     }
@@ -1152,8 +1337,139 @@ mod tests {
                 "--test-threads=1",
             ])
             .env(CHILD_MODE_VAR, mode)
-            .env(CHILD_DIR_VAR, dir);
+            .env(CHILD_DIR_VAR, dir)
+            .env("HALLOUMINATE_LOG", "hallouminate=info");
         Ok(command)
+    }
+
+    struct OwnedChildren(Vec<std::process::Child>);
+
+    impl Drop for OwnedChildren {
+        fn drop(&mut self) {
+            for child in &mut self.0 {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    fn wait_child(child: &mut std::process::Child) -> anyhow::Result<std::process::ExitStatus> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = child.try_wait()? {
+                return Ok(status);
+            }
+            if Instant::now() >= deadline {
+                child.kill()?;
+                child.wait()?;
+                anyhow::bail!("child did not exit within five seconds");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn oversized_daemon_burst_does_not_fill_bootstrap_stderr() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let stderr = dir.path().join("stderr-capture");
+        let mut child = child_command("oversize_burst", dir.path())?
+            .stdout(std::process::Stdio::null())
+            .stderr(File::create(&stderr)?)
+            .spawn()?;
+        assert!(
+            wait_child(&mut child)?.success(),
+            "daemon-role child failed"
+        );
+        let captured = std::fs::metadata(&stderr)?.len();
+        assert!(
+            captured < 4096,
+            "oversized payload filled stderr: {captured} bytes"
+        );
+        let log = std::fs::read_to_string(dir.path().join("daemon.log"))?;
+        assert!(log.contains("valid-marker"), "valid event was not logged");
+        assert!(
+            !log.contains(&"x".repeat(128 * 1024)),
+            "oversized payload entered the log"
+        );
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_write_with_unread_stderr_pipe_has_bounded_shutdown() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut child = child_command("failed_write", dir.path())?
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+        assert!(
+            wait_child(&mut child)?.success(),
+            "failed-write child did not shut down cleanly"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_retention_waits_for_shared_lock_and_keeps_exact_budget() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let paths = ["cli-101.log", "cli-102.log", "cli-103.log"];
+        for (index, name) in paths.iter().enumerate() {
+            let path = dir.path().join(name);
+            std::fs::write(&path, [b'x'; 64])?;
+            File::options()
+                .write(true)
+                .open(&path)?
+                .set_modified(UNIX_EPOCH + Duration::from_secs(u64::try_from(index + 1)?))?;
+        }
+        let retention = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.path().join(RETENTION_LOCK))?;
+        retention.lock()?;
+        let mut children = OwnedChildren(Vec::new());
+        for _ in 0..2 {
+            children.0.push(
+                child_command("prune", dir.path())?
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()?,
+            );
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        for child in &mut children.0 {
+            let marker = dir.path().join(format!("ready-{}", child.id()));
+            while !marker.exists() {
+                assert!(
+                    child.try_wait()?.is_none(),
+                    "pruner exited before readiness"
+                );
+                assert!(Instant::now() < deadline, "pruner did not reach cleanup");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        for child in &mut children.0 {
+            assert!(
+                child.try_wait()?.is_none(),
+                "pruner ignored the retention lock"
+            );
+        }
+        for name in paths {
+            assert!(
+                dir.path().join(name).exists(),
+                "{name} was removed while locked"
+            );
+        }
+        drop(retention);
+        for child in &mut children.0 {
+            assert!(wait_child(child)?.success(), "pruner child failed");
+        }
+        assert!(!dir.path().join("cli-101.log").exists());
+        assert!(dir.path().join("cli-102.log").exists());
+        assert!(dir.path().join("cli-103.log").exists());
+        Ok(())
     }
 
     #[test]

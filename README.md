@@ -266,10 +266,13 @@ thin clients that talk to it over a Unix domain socket.
   `$XDG_STATE_HOME/hallouminate/` (default `~/.local/state/hallouminate/`).
   Development builds use `hallouminate-dev` instead. The daemon writes
   `daemon.log`. MCP servers write `serve-<pid>.log`, and CLI commands that log
-  write `cli-<pid>.log`. Each file rotates at 10 MiB into numbered archives.
-  Pruning targets 100 MiB across all files and skips files held by other writers.
-  Records larger than the file limit go to stderr. Panics are logged with a
-  backtrace. Configure
+  write `cli-<pid>.log`. New process logs and bootstrap captures are owner-only
+  on Unix. They can contain sensitive diagnostics, including panic payloads.
+  Each file rotates at 10 MiB into numbered archives. Pruning targets 100 MiB
+  across all files and skips files held by other writers. Lowering the file
+  limit removes oversized removable archives; another live writer's files stay.
+  Oversized records are dropped without copying their payload to stderr.
+  Panics are logged with a backtrace. Configure
   `[logging].max_file_bytes` / `max_total_bytes`, or override them with
   `HALLOUMINATE_LOG_MAX_FILE_BYTES` / `HALLOUMINATE_LOG_MAX_TOTAL_BYTES`.
   `[watch].failure_reminder_secs` defaults to 60 seconds; override it with

@@ -83,14 +83,19 @@ max_total_bytes = 104857600 # 100 MiB
 
 `max_total_bytes` bounds all of these files together, plus legacy
 `hallouminate.log` and `hallouminate.log.N` files from older versions. At
-startup and after each rotation, a process deletes files oldest-first until
-the directory has room for one more full file. It deletes files of dead
-processes and its own archives only. Each writer holds an advisory lock on
-`<name>.log.lock` while it runs, and a file is dead only when its lock is
-free, so a reused pid cannot expose a live file to deletion. Live files of
-other processes can therefore keep the total above the limit until those
-processes exit. Both limits must be nonzero and the total must be at least
-the per-file limit.
+startup and after each rotation, a process removes oversized archives it owns
+or can claim. It then deletes eligible files oldest-first until the directory
+has room for one more full file. It does not delete its active file or files
+of another live process. If a prior active file exceeds a lowered file limit,
+it rotates before the next valid record and its oversized archive is removed.
+Each writer holds an advisory lock on `<name>.log.lock` while it runs. A stable
+per-directory lock serializes retention passes across processes. Live files of
+other processes can keep the total above the limit until those processes exit.
+Records larger than `max_file_bytes` are dropped without stderr payload output.
+Both limits must be nonzero and the total must be at least the per-file limit.
+New process logs and bootstrap captures are owner-only on Unix. Existing file
+permissions are not changed. Stored diagnostics can contain sensitive panic
+payloads.
 
 A panic in any thread is logged as an `ERROR` event with target
 `hallouminate::panic`. The event carries the thread name, location, payload,
