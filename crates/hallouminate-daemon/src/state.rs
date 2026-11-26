@@ -47,6 +47,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 #[cfg(test)]
 use std::sync::Condvar;
+#[cfg(test)]
+use tokio::sync::Notify;
 use tokio::sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -385,6 +387,8 @@ struct DaemonStateInner {
     /// dir concurrently (the single-open-per-ground-dir invariant), without
     /// holding the `resources` map lock across that async open.
     resource_build_locks: KeyedLockMap<ResourceKey>,
+    #[cfg(test)]
+    resource_lookup_pause: StdMutex<Option<(Arc<Notify>, Arc<Notify>)>>,
     /// Per-ground-dir lock. Two `ResourceKey`s can name one ground dir, so
     /// the stale-store check, move, and open serialize on the dir itself.
     ground_dir_locks: KeyedLockMap<PathBuf>,
@@ -697,6 +701,8 @@ impl DaemonState {
                     baseline_resources,
                     resources: Mutex::new(resources_map),
                     resource_build_locks: KeyedLockMap::default(),
+                    #[cfg(test)]
+                    resource_lookup_pause: StdMutex::new(None),
                     ground_dir_locks: KeyedLockMap::default(),
                     corpus_locks: KeyedLockMap::default(),
                     store_lock_owner,
@@ -849,6 +855,15 @@ impl DaemonState {
     pub(crate) fn coverage_probe(&self) -> Arc<CoverageProbe> {
         Arc::clone(&self.inner.coverage_probe)
     }
+    #[cfg(test)]
+    pub(crate) fn pause_next_resource_lookup(&self, entered: Arc<Notify>, resume: Arc<Notify>) {
+        *self
+            .inner
+            .resource_lookup_pause
+            .lock()
+            .expect("resource lookup pause") = Some((entered, resume));
+    }
+
     /// Per-request resource seam (B2+B3): resolve (or lazily build) the
     /// `RequestResources` for the effective config's `(ground_dir, model,
     /// quantized, enabled)` key. A repo-layer override of any of those
@@ -861,6 +876,18 @@ impl DaemonState {
     /// opens in its place. The request does not reindex. The watcher's
     /// admitted catch-up refills the fresh store from source.
     pub async fn resources_for(&self, cfg: &Config) -> anyhow::Result<Arc<RequestResources>> {
+        #[cfg(test)]
+        let pause = self
+            .inner
+            .resource_lookup_pause
+            .lock()
+            .expect("resource lookup pause")
+            .take();
+        #[cfg(test)]
+        if let Some((entered, resume)) = pause {
+            entered.notify_one();
+            resume.notified().await;
+        }
         self.resources_for_with_initializer(cfg, |model, quantized, cache_dir| async move {
             init_embedder(&model, quantized, cache_dir).await
         })

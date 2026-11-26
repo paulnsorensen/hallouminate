@@ -21,6 +21,8 @@
 //! `handle_add_markdown` take, so a watch-triggered reindex never races the
 //! daemon's own writes.
 
+#[cfg(target_os = "linux")]
+mod native;
 pub(crate) mod registry;
 
 pub(crate) use registry::{ConfigSource, WatchRegistry};
@@ -46,8 +48,21 @@ use super::churn::{ChurnTracker, ReindexEffect};
 use super::dispatch::index_single_file_with_content;
 use super::ladder::LadderOutcome;
 use super::state::{DaemonState, IdleClock, WorkClass, corpus_lock_keys, path_lock_keys};
-use registry::RegistrationId;
+use registry::{DetachedRootObservation, RegistrationId};
 use tokio_util::task::TaskTracker;
+
+#[cfg(target_os = "linux")]
+use native::NativeWatcher;
+#[cfg(not(target_os = "linux"))]
+type NativeWatcher = notify::RecommendedWatcher;
+
+type NativeDebouncer = notify_debouncer_full::Debouncer<NativeWatcher, NoCache>;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RootResolution {
+    Resolved,
+    Unresolved,
+}
 
 /// One watched location: the directory handed to `notify`, the corpus that
 /// owns it, and — for a **file-path** corpus root — the exact declared file.
@@ -77,6 +92,8 @@ pub(crate) struct WatchRoot {
     canonical_watched: PathBuf,
     corpus: CorpusConfig,
     canonical_file_root: Option<PathBuf>,
+    configured_file_root: Option<PathBuf>,
+    resolution: RootResolution,
     /// Recursion mode handed to `notify`. A directory root watches its whole
     /// subtree (`Recursive`); a file-path root watches only its parent dir's
     /// direct entries (`NonRecursive`) — enough to catch edits and the
@@ -232,6 +249,15 @@ impl ReloadFailureMemo {
     fn record_success(&mut self, path: &Path) -> bool {
         self.failures.remove(path).is_some()
     }
+
+    /// Drops failure and warning records for paths that are no longer
+    /// repo-layer sources, so retired paths neither accumulate nor silence a
+    /// re-registered path that fails with the same error.
+    fn retain_sources(&mut self, sources: &[PathBuf]) {
+        self.failures.retain(|path, _error| sources.contains(path));
+        self.path_warnings
+            .retain(|path, _warnings| sources.contains(path));
+    }
 }
 
 /// Owns the background debouncer and event-pump task.
@@ -308,6 +334,9 @@ fn reload_repo_layer(
                 error,
                 "watcher: repo-layer reload failed; retaining registrations for retry"
             );
+            if confirmed_absent(path) {
+                state.watch_registry().forget_retry_source(path);
+            }
             return;
         }
     };
@@ -344,12 +373,7 @@ fn reload_repo_layer(
                 tracing::info!(target: "hallouminate::daemon", path = %path.display(), "watcher: repo-layer reload recovered");
             }
             for registration in retired {
-                let state = state.clone();
-                tracker.spawn(async move {
-                    let _conn = state.enter_connection(WorkClass::Internal);
-                    cleanup_retired_registration(&state, registration).await;
-                    state.touch_activity(WorkClass::Internal, IdleClock::Keep);
-                });
+                spawn_retired_cleanup(state, tracker, registration);
             }
         }
         Err(error) => {
@@ -361,42 +385,288 @@ fn reload_repo_layer(
     }
 }
 
+/// Consecutive reconcile ticks that a retirable registration's root must
+/// stay absent before `retire_missing_registrations` retires it.
+const MISSING_ROOT_RETIRE_TICKS: u32 = 3;
+
+/// Runs the periodic reconcile tick: retires registrations whose root has
+/// been absent for `MISSING_ROOT_RETIRE_TICKS`, reloads every repo-layer
+/// source, marks every registration due, and reconciles the debouncer.
+fn run_reconcile_tick(
+    state: &DaemonState,
+    pump: &mut PumpState,
+    tracker: &TaskTracker,
+    reload_failures: &mut ReloadFailureMemo,
+) {
+    let sources = state.watch_registry().repo_layer_sources();
+    reload_failures.retain_sources(&sources);
+    for path in sources {
+        reload_repo_layer(state, &path, tracker, reload_failures);
+    }
+    retire_missing_registrations(state, tracker);
+    for registration in state.watch_registry().take_pending_cleanups() {
+        spawn_retired_cleanup(state, tracker, registration);
+    }
+    state.watch_registry().mark_reconcile_due_all();
+    pump.reconcile(state, tracker, WatchRetry::ReconcileTick);
+}
+
+/// Counts one tick of root absence for every retirable registration and
+/// retires each one that reached `MISSING_ROOT_RETIRE_TICKS`.
+///
+/// A registration is retirable only when nothing will declare it again:
+/// a repo-layer registration whose config file is gone, or a baseline
+/// registration that the baseline config does not declare. A declared
+/// baseline root stays registered while absent, so a later directory
+/// creation still installs its watch. A root that exists, or whose
+/// existence check fails, never counts as absent.
+fn collect_root_observations(
+    state: &DaemonState,
+) -> HashMap<registry::RegistrationId, registry::RootObservation> {
+    let registry = state.watch_registry();
+    let declared = state.baseline().effective_corpora().ok();
+    let mut observations = HashMap::new();
+    for probe in registry.root_probes() {
+        let retirable = match &probe.id.source {
+            ConfigSource::RepoLayer(config_path) => confirmed_absent(config_path),
+            ConfigSource::Baseline => match &declared {
+                Some(declared) => !declared.iter().any(|corpus| {
+                    corpus.name == probe.corpus.name && corpus.paths == probe.corpus.paths
+                }),
+                None => false,
+            },
+        };
+        let mut roots = Vec::new();
+        for raw in &probe.corpus.paths {
+            roots.push(expand_tilde(raw));
+        }
+        if roots.is_empty() {
+            roots.push(probe.id.corpus_key.canonical_root.clone());
+        }
+        let presence = if retirable
+            && roots.iter().all(|root| confirmed_absent(root))
+            && probe.saved_roots.iter().all(|root| confirmed_absent(root))
+        {
+            registry::RootPresence::Absent
+        } else if retirable
+            && checkout_confirmed_absent(&probe.id.source)
+            && roots.iter().all(|root| confirmed_absent(root))
+        {
+            registry::RootPresence::CheckoutAbsent
+        } else {
+            registry::RootPresence::Present
+        };
+        observations.insert(
+            probe.id.clone(),
+            registry::RootObservation { probe, presence },
+        );
+    }
+    observations
+}
+
+fn retire_missing_registrations(state: &DaemonState, tracker: &TaskTracker) {
+    let registry = state.watch_registry();
+    let observations = collect_root_observations(state);
+    for registration in registry.record_absent_roots(&observations, MISSING_ROOT_RETIRE_TICKS) {
+        spawn_retired_cleanup(state, tracker, registration);
+    }
+    let detached = registry.detached_probes();
+    let mut observations = Vec::new();
+    for (binding, roots) in detached {
+        let mut absences = Vec::new();
+        for root in roots {
+            absences.push((root.clone(), confirmed_absent(&root)));
+        }
+        observations.push(DetachedRootObservation { binding, absences });
+    }
+    registry.record_detached_absence(&observations, MISSING_ROOT_RETIRE_TICKS);
+}
+
+fn checkout_confirmed_absent(source: &ConfigSource) -> bool {
+    let ConfigSource::RepoLayer(config_path) = source else {
+        return false;
+    };
+    if config_path
+        .file_name()
+        .is_none_or(|name| name != "config.toml")
+    {
+        return false;
+    }
+    let Some(config_dir) = config_path.parent() else {
+        return false;
+    };
+    if config_dir
+        .file_name()
+        .is_none_or(|name| name != ".hallouminate")
+    {
+        return false;
+    }
+    let Some(repo) = config_dir.parent() else {
+        return false;
+    };
+    confirmed_absent(repo)
+}
+
+/// Whether `path` is confirmed absent. A failed existence check is not
+/// absence, so a permission error never retires a live root.
+fn confirmed_absent(path: &Path) -> bool {
+    match path.try_exists() {
+        Ok(exists) => !exists,
+        Err(_error) => false,
+    }
+}
+
+fn spawn_retired_cleanup(
+    state: &DaemonState,
+    tracker: &TaskTracker,
+    mut registration: registry::RetiredRegistration,
+) {
+    if registration.log_missing_root {
+        tracing::info!(
+            target: "hallouminate::daemon",
+            corpus = %registration.corpus,
+            root = %registration.root.display(),
+            absent_ticks = MISSING_ROOT_RETIRE_TICKS,
+            "watcher: retired registration; watch root is missing",
+        );
+        registration.log_missing_root = false;
+    }
+    let state = state.clone();
+    tracker.spawn(async move {
+        let _conn = state.enter_connection(WorkClass::Internal);
+        if let Some(failed) = cleanup_retired_registration(&state, registration).await {
+            state.watch_registry().park_failed_cleanup(failed);
+        }
+        state.touch_activity(WorkClass::Internal, IdleClock::Keep);
+    });
+}
+
+/// Deletes rows for retired roots that remain absent after resource setup.
+/// Returns tracked cleanup until all sibling roots settle.
 async fn cleanup_retired_registration(
     state: &DaemonState,
-    registration: registry::RetiredRegistration,
-) {
-    let root_path = registration.root.clone();
-    let retired = match tokio::task::spawn_blocking(move || {
-        hallouminate_domain::common::retired_roots(std::slice::from_ref(&registration.root))
-            .into_iter()
-            .next()
-            .map(|root| (root, registration.cfg))
-    })
-    .await
+    mut registration: registry::RetiredRegistration,
+) -> Option<registry::RetiredRegistration> {
+    let loud = registration.warns_on_failure();
+    if registration
+        .ordinary_owner
+        .as_ref()
+        .is_some_and(|token| !token.load(std::sync::atomic::Ordering::SeqCst))
     {
-        Ok(Some(retired)) => retired,
-        Ok(None) => return,
-        Err(error) => {
-            tracing::warn!(target: "hallouminate::daemon", root = %root_path.display(), error = %error, "watcher: retired-root check failed; retaining storage rows");
-            return;
-        }
-    };
-    let (root, cfg) = retired;
-    let resources = match state.resources_for(&cfg).await {
+        return None;
+    }
+    let resources = match state.resources_for(&registration.cfg).await {
         Ok(resources) => resources,
         Err(error) => {
-            tracing::warn!(target: "hallouminate::daemon", root = %root.as_path().display(), error = %error, "watcher: retired-root storage access failed; retaining storage rows");
-            return;
+            if loud {
+                tracing::warn!(target: "hallouminate::daemon", corpus = %registration.corpus, error = %error, "watcher: retired-root storage access failed; will retry on next reconcile");
+            } else {
+                tracing::debug!(target: "hallouminate::daemon", corpus = %registration.corpus, error = %error, "watcher: retired-root storage access failed; will retry on next reconcile");
+            }
+            return Some(registry::RetiredRegistration {
+                failed_attempts: registration.failed_attempts.saturating_add(1),
+                ..registration
+            });
         }
     };
-    match resources.store.delete_root(&root).await {
-        Ok(_) => {
-            tracing::info!(target: "hallouminate::daemon", root = %root.as_path().display(), ground_dir = %cfg.storage.ground_dir, "watcher: retired root rows deleted");
+    let shutdown = state.shutdown_token().clone();
+    let _guard = tokio::select! {
+        biased;
+        () = shutdown.cancelled() => return Some(registration),
+        guard = state.acquire_mutation_guard(&registration.lock_keys) => match guard {
+            Ok(guard) => guard,
+            Err(crate::backpressure::RETRYABLE_HARD_DEBT) => return Some(registration),
+            Err(error) => {
+                tracing::warn!(target: "hallouminate::daemon", corpus = %registration.corpus, error = %error, "watcher: retired-root cleanup could not take the write lane; will retry on next reconcile");
+                return Some(registration);
+            }
+        },
+    };
+    let mut failed = Vec::new();
+    for retired in &registration.roots {
+        let path = retired;
+        let probe = path.clone();
+        let checked = tokio::task::spawn_blocking(move || {
+            hallouminate_domain::common::RetiredRoot::probe(&probe)
+        })
+        .await;
+        let root = match checked {
+            Ok(Ok(Some(root))) => root,
+            Ok(Ok(None)) => {
+                if registration.detached.is_some() || registration.ordinary_owner.is_some() {
+                    registration.waiting_roots.push(retired.clone());
+                }
+                continue;
+            }
+            Ok(Err(error)) => {
+                if loud {
+                    tracing::warn!(target: "hallouminate::daemon", root = %path.display(), error = %error, "watcher: retired-root check failed; will retry on next reconcile");
+                } else {
+                    tracing::debug!(target: "hallouminate::daemon", root = %path.display(), error = %error, "watcher: retired-root check failed; will retry on next reconcile");
+                }
+                failed.push(retired.clone());
+                continue;
+            }
+            Err(error) => {
+                if loud {
+                    tracing::warn!(target: "hallouminate::daemon", root = %path.display(), error = %error, "watcher: retired-root check failed; will retry on next reconcile");
+                } else {
+                    tracing::debug!(target: "hallouminate::daemon", root = %path.display(), error = %error, "watcher: retired-root check failed; will retry on next reconcile");
+                }
+                failed.push(retired.clone());
+                continue;
+            }
+        };
+        if registration
+            .detached
+            .as_ref()
+            .is_some_and(|token| !token.load(std::sync::atomic::Ordering::SeqCst))
+        {
+            return Some(registration);
         }
-        Err(error) => {
-            tracing::warn!(target: "hallouminate::daemon", root = %root.as_path().display(), error = %error, "watcher: retired-root cleanup failed; retaining retry work");
+        if registration
+            .ordinary_owner
+            .as_ref()
+            .is_some_and(|token| !token.load(std::sync::atomic::Ordering::SeqCst))
+        {
+            return None;
+        }
+        if (registration.detached.is_some() || registration.ordinary_owner.is_some())
+            && state
+                .watch_registry()
+                .live_claims_retired_root(&registration.cfg, path)
+        {
+            registration.waiting_roots.push(retired.clone());
+            continue;
+        }
+        match resources.store.delete_root(&root).await {
+            Ok(_) => {
+                tracing::info!(target: "hallouminate::daemon", root = %path.display(), ground_dir = %registration.cfg.storage.ground_dir, "watcher: retired root rows deleted");
+            }
+            Err(error) => {
+                if loud {
+                    tracing::warn!(target: "hallouminate::daemon", root = %path.display(), error = %error, "watcher: retired-root cleanup failed; will retry on next reconcile");
+                } else {
+                    tracing::debug!(target: "hallouminate::daemon", root = %path.display(), error = %error, "watcher: retired-root cleanup failed; will retry on next reconcile");
+                }
+                failed.push(retired.clone());
+            }
         }
     }
+    if failed.is_empty() && registration.detached.is_none() && registration.ordinary_owner.is_none()
+    {
+        return None;
+    }
+    let failed_attempts = if failed.is_empty() {
+        registration.failed_attempts
+    } else {
+        registration.failed_attempts.saturating_add(1)
+    };
+    Some(registry::RetiredRegistration {
+        roots: failed,
+        failed_attempts,
+        ..registration
+    })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -508,7 +778,7 @@ struct NativeWatchHook {
 /// `UpdatePathsError` for a configured path or a stream-restart failure.
 #[cfg(test)]
 fn native_update_paths(
-    debouncer: &mut notify_debouncer_full::Debouncer<notify::RecommendedWatcher, NoCache>,
+    debouncer: &mut NativeDebouncer,
     ops: Vec<PathOp>,
     hook: &mut Option<std::sync::Arc<std::sync::Mutex<NativeWatchHook>>>,
 ) -> Result<(), Box<UpdatePathsError>> {
@@ -586,7 +856,7 @@ fn native_update_paths(
 /// debouncer, the set of paths currently `debouncer.watch()`'d, and the
 /// flattened current root list used by `process_change_batch`.
 struct PumpState {
-    debouncer: Option<notify_debouncer_full::Debouncer<notify::RecommendedWatcher, NoCache>>,
+    debouncer: Option<NativeDebouncer>,
     installed: HashMap<PathBuf, RecursiveMode>,
     roots: Vec<WatchRoot>,
     /// Registrations already marked `Degraded` because the native backend
@@ -613,7 +883,22 @@ impl PumpState {
         registry.refresh_roots(watch_roots_for);
         let snapshot = registry.snapshot_roots();
         let desired = Self::desired_watches(&snapshot);
-        self.roots = snapshot.iter().map(|(_, r)| r.clone()).collect();
+        self.roots.clear();
+        for (_, root) in &snapshot {
+            if let (Some(configured), Some(canonical)) =
+                (&root.configured_file_root, &root.canonical_file_root)
+                && confirmed_absent(configured)
+                && let Ok(true) = canonical.try_exists()
+            {
+                continue;
+            }
+            if root.canonical_file_root.is_some()
+                || root.watched == root.canonical_watched
+                || !confirmed_absent(&root.watched)
+            {
+                self.roots.push(root.clone());
+            }
+        }
         let ops = self.build_reconcile_ops(registry, &snapshot, &desired, retry);
         self.apply_reconcile_ops(registry, &snapshot, ops);
         Self::admit_next_catch_up(registry, state, tracker);
@@ -988,26 +1273,14 @@ fn spawn_registration_catch_up(state: DaemonState, id: RegistrationId, tracker: 
                             Ok(())
                         }
                         Err(e) => {
-                            tracing::warn!(
-                                target: "hallouminate::daemon",
-                                corpus = %corpus.name,
-                                source = ?id.source,
-                                error = %e,
-                                "watcher: reconcile pass failed; will retry on the next reconcile tick",
-                            );
+                            report_reconcile_failure(&state, &id, &corpus.name, &e.to_string());
                             state.touch_activity(WorkClass::Internal, IdleClock::Keep);
                             Err(e.to_string())
                         }
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        target: "hallouminate::daemon",
-                        corpus = %corpus.name,
-                        source = ?id.source,
-                        error = %e,
-                        "watcher: reconcile pass failed; will retry on the next reconcile tick",
-                    );
+                    report_reconcile_failure(&state, &id, &corpus.name, &e.to_string());
                     state.touch_activity(WorkClass::Internal, IdleClock::Keep);
                     Err(e.to_string())
                 }
@@ -1024,6 +1297,28 @@ fn spawn_registration_catch_up(state: DaemonState, id: RegistrationId, tracker: 
             );
         }
     });
+}
+
+/// Logs a failed catch-up pass at `warn`, or at `debug` when the pass
+/// failed with the same error as the registration's previous pass.
+fn report_reconcile_failure(state: &DaemonState, id: &RegistrationId, corpus: &str, error: &str) {
+    if state.watch_registry().repeats_last_error(id, error) {
+        tracing::debug!(
+            target: "hallouminate::daemon",
+            corpus = %corpus,
+            source = ?id.source,
+            error = %error,
+            "watcher: reconcile pass failed; will retry on the next reconcile tick",
+        );
+    } else {
+        tracing::warn!(
+            target: "hallouminate::daemon",
+            corpus = %corpus,
+            source = ?id.source,
+            error = %error,
+            "watcher: reconcile pass failed; will retry on the next reconcile tick",
+        );
+    }
 }
 
 /// What one `register_runtime_corpora` call did.
@@ -1093,7 +1388,7 @@ fn build_debouncer(
     wake: std::sync::Arc<tokio::sync::Notify>,
     pending: std::sync::Arc<std::sync::Mutex<PendingPaths>>,
     quiet: bool,
-) -> Option<notify_debouncer_full::Debouncer<notify::RecommendedWatcher, NoCache>> {
+) -> Option<NativeDebouncer> {
     let debounce = Duration::from_millis(cfg.watch.debounce_ms);
     // unbounded channel: a write burst that outpaces the serial async
     // consumer used to retain every debounced batch in daemon memory
@@ -1208,11 +1503,7 @@ async fn run_pump(
                 continue;
             }
             _ = reconcile_tick.tick() => {
-                for path in state.watch_registry().repo_layer_sources() {
-                    reload_repo_layer(&state, &path, &tracker, &mut reload_failures);
-                }
-                state.watch_registry().mark_reconcile_due_all();
-                pump.reconcile(&state, &tracker, WatchRetry::ReconcileTick);
+                run_reconcile_tick(&state, &mut pump, &tracker, &mut reload_failures);
                 last_reconciled = state.watch_registry().generation();
                 state
                     .heartbeat()
@@ -1303,9 +1594,7 @@ fn spawn_corpus_watcher_with(
         std::sync::Arc<tokio::sync::Notify>,
         std::sync::Arc<std::sync::Mutex<PendingPaths>>,
         bool,
-    ) -> Option<
-        notify_debouncer_full::Debouncer<notify::RecommendedWatcher, NoCache>,
-    >,
+    ) -> Option<NativeDebouncer>,
 ) -> Option<WatcherHandle> {
     let cfg = state.baseline();
     let failure_reminder = Duration::from_secs(cfg.watch.failure_reminder_secs);
@@ -1449,32 +1738,40 @@ fn record_pending(
 /// Retains a not-yet-created root so recovery can install it when it appears.
 fn build_watch_root(corpus: &CorpusConfig, raw: &str) -> Option<WatchRoot> {
     let root = expand_tilde(raw);
+    let (canonical_root, resolution) = match root.canonicalize() {
+        Ok(canonical) => (canonical, RootResolution::Resolved),
+        Err(_) => (root.clone(), RootResolution::Unresolved),
+    };
     if root.is_dir() {
-        let canonical_watched = canonicalize_or_passthrough(&root).into_path_buf();
         Some(WatchRoot {
             watched: root,
-            canonical_watched,
+            canonical_watched: canonical_root,
             corpus: corpus.clone(),
             canonical_file_root: None,
+            configured_file_root: None,
+            resolution,
             mode: RecursiveMode::Recursive,
         })
     } else if root.is_file() {
         let parent = root.parent()?.to_path_buf();
         let canonical_watched = canonicalize_or_passthrough(&parent).into_path_buf();
-        let canonical_file_root = Some(canonicalize_or_passthrough(&root).into_path_buf());
         Some(WatchRoot {
             watched: parent,
             canonical_watched,
             corpus: corpus.clone(),
-            canonical_file_root,
+            canonical_file_root: Some(canonical_root),
+            configured_file_root: Some(root),
+            resolution,
             mode: RecursiveMode::NonRecursive,
         })
     } else {
         Some(WatchRoot {
-            canonical_watched: canonicalize_or_passthrough(&root).into_path_buf(),
+            canonical_watched: canonical_root,
             watched: root,
             corpus: corpus.clone(),
             canonical_file_root: None,
+            configured_file_root: None,
+            resolution,
             mode: RecursiveMode::Recursive,
         })
     }
@@ -1615,10 +1912,10 @@ async fn handle_changed_path(
         ) {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!(
-                    target: "hallouminate::daemon",
-                    path = %path.display(),
-                    error = ?e,
+                report_path_failure(
+                    failures,
+                    path,
+                    &format!("{e:?}"),
                     "watcher: skipping reindex, no-follow read failed",
                 );
                 return false;
@@ -1654,23 +1951,7 @@ async fn handle_changed_path(
                 );
             }
             Err(e) => {
-                let error = e.to_string();
-                match failures.record(path, &error, Instant::now()) {
-                    FailureDecision::First => tracing::warn!(
-                        target: "hallouminate::daemon",
-                        path = %path.display(),
-                        error = %error,
-                        "watcher: reindex failed",
-                    ),
-                    FailureDecision::Suppress => {}
-                    FailureDecision::Reminder { suppressed } => tracing::warn!(
-                        target: "hallouminate::daemon",
-                        path = %path.display(),
-                        error = %error,
-                        suppressed,
-                        "watcher: reindex failed",
-                    ),
-                }
+                report_path_failure(failures, path, &e.to_string(), "watcher: reindex failed");
             }
         }
     } else {
@@ -1704,6 +1985,33 @@ async fn handle_changed_path(
     }
     drop(guard);
     restarts_idle_clock
+}
+
+/// Logs a per-path watcher failure through `failures`: `warn` on the first
+/// occurrence and on each reminder, nothing while the signature is
+/// suppressed.
+fn report_path_failure(
+    failures: &mut FailureCoalescer,
+    path: &Path,
+    error: &str,
+    message: &'static str,
+) {
+    match failures.record(path, error, Instant::now()) {
+        FailureDecision::First => tracing::warn!(
+            target: "hallouminate::daemon",
+            path = %path.display(),
+            error = %error,
+            "{message}",
+        ),
+        FailureDecision::Suppress => {}
+        FailureDecision::Reminder { suppressed } => tracing::warn!(
+            target: "hallouminate::daemon",
+            path = %path.display(),
+            error = %error,
+            suppressed,
+            "{message}",
+        ),
+    }
 }
 
 /// Stage-1 change gate (ADR daemon-rework-003): does `path`'s on-disk mtime
@@ -1897,6 +2205,8 @@ mod tests {
             canonical_watched: PathBuf::from(watched),
             corpus,
             canonical_file_root: file_root.map(PathBuf::from),
+            configured_file_root: file_root.map(PathBuf::from),
+            resolution: RootResolution::Resolved,
             mode,
         }
     }
@@ -2085,6 +2395,8 @@ mod tests {
             canonical_watched: PathBuf::from("/real/wiki"),
             corpus: corpus("wiki", "/link/wiki", &["**/*.md"]),
             canonical_file_root: None,
+            configured_file_root: None,
+            resolution: RootResolution::Resolved,
             mode: RecursiveMode::Recursive,
         };
         let deleted = Path::new("/real/wiki/topics/spice.md");
@@ -2108,6 +2420,8 @@ mod tests {
             canonical_watched: PathBuf::from("/private/var/tmp/wiki"),
             corpus: corpus("wiki", "/var/tmp/wiki", &["**/*.md"]),
             canonical_file_root: None,
+            configured_file_root: None,
+            resolution: RootResolution::Resolved,
             mode: RecursiveMode::Recursive,
         };
         let roots = [root];
@@ -2129,6 +2443,8 @@ mod tests {
             canonical_watched: PathBuf::from("/a"),
             corpus: corpus("plain", "/a", &["**/*.md"]),
             canonical_file_root: None,
+            configured_file_root: None,
+            resolution: RootResolution::Resolved,
             mode: RecursiveMode::Recursive,
         };
         let linked = WatchRoot {
@@ -2136,6 +2452,8 @@ mod tests {
             canonical_watched: PathBuf::from("/b/real"),
             corpus: corpus("linked", "/a/link", &["**/*.md"]),
             canonical_file_root: None,
+            configured_file_root: None,
+            resolution: RootResolution::Resolved,
             mode: RecursiveMode::Recursive,
         };
         assert_eq!(
@@ -2152,6 +2470,8 @@ mod tests {
             canonical_watched: PathBuf::from("/real/wiki"),
             corpus: corpus("wiki", "/link/wiki", &["**/*.md"]),
             canonical_file_root: None,
+            configured_file_root: None,
+            resolution: RootResolution::Resolved,
             mode: RecursiveMode::Recursive,
         };
         let roots = vec![owner];
@@ -5419,5 +5739,4645 @@ body
             "cancelled catch-up must return an error instead of applying the plan"
         );
         drop(held_permit);
+    }
+
+    type CapturedEvents = Vec<(tracing::Level, HashMap<String, String>)>;
+
+    /// Records every event's level and fields on the thread that installs it.
+    #[derive(Clone, Default)]
+    struct LogCapture(std::sync::Arc<std::sync::Mutex<CapturedEvents>>);
+
+    impl LogCapture {
+        fn install(&self) -> tracing::subscriber::DefaultGuard {
+            use tracing_subscriber::layer::SubscriberExt;
+            // A permanent permissive global default keeps the callsite
+            // interest caches stable while parallel tests swap scoped
+            // subscribers (see `churn.rs` `captured_warns`).
+            static GLOBAL: std::sync::Once = std::sync::Once::new();
+            GLOBAL.call_once(|| {
+                let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
+            });
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(self.clone()))
+        }
+
+        fn events(&self, level: tracing::Level, message: &str) -> Vec<HashMap<String, String>> {
+            let mut matched = Vec::new();
+            for (event_level, fields) in self.0.lock().expect("capture lock").iter() {
+                if *event_level == level
+                    && fields.get("message").map(String::as_str) == Some(message)
+                {
+                    matched.push(fields.clone());
+                }
+            }
+            matched
+        }
+    }
+
+    struct FieldMap<'a>(&'a mut HashMap<String, String>);
+
+    impl tracing::field::Visit for FieldMap<'_> {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.insert(field.name().to_owned(), value.to_owned());
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name().to_owned(), format!("{value:?}"));
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for LogCapture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut fields = HashMap::new();
+            event.record(&mut FieldMap(&mut fields));
+            self.0
+                .lock()
+                .expect("capture lock")
+                .push((*event.metadata().level(), fields));
+        }
+    }
+
+    const RETIRED_MESSAGE: &str = "watcher: retired registration; watch root is missing";
+
+    /// Opens a daemon state under `tmp` and registers the repo-layer corpus
+    /// `cheese` at `<tmp>/repo/.cheese`, sourced from
+    /// `<tmp>/repo/.hallouminate/config.toml`. Returns the state, the repo
+    /// directory, and the corpus root.
+    async fn repo_layer_fixture(tmp: &Path) -> (DaemonState, PathBuf, PathBuf) {
+        let tmp = tmp.canonicalize().expect("canonicalize tempdir");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = tmp.join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg.clone(), None).await.expect("open");
+        let repo = tmp.join("repo");
+        let root = repo.join(".cheese");
+        std::fs::create_dir_all(&root).expect("create corpus root");
+        std::fs::create_dir_all(repo.join(".hallouminate")).expect("create config dir");
+        let config_path = repo.join(".hallouminate").join("config.toml");
+        std::fs::write(&config_path, "").expect("write repo config");
+        register_runtime_corpora(
+            &state,
+            Some(&config_path),
+            &[corpus("cheese", root.to_str().unwrap(), &["**/*.md"])],
+            &cfg,
+        )
+        .expect("register");
+        assert!(registered(&state, "cheese"));
+        (state, repo, root)
+    }
+
+    fn registered(state: &DaemonState, name: &str) -> bool {
+        let mut found = false;
+        for (id, _root) in state.watch_registry().snapshot_roots() {
+            if id.corpus_key.name == name {
+                found = true;
+            }
+        }
+        found
+    }
+
+    fn reconcile_ticks(
+        state: &DaemonState,
+        pump: &mut PumpState,
+        tracker: &TaskTracker,
+        memo: &mut ReloadFailureMemo,
+        count: u32,
+    ) {
+        for _ in 0..count {
+            run_reconcile_tick(state, pump, tracker, memo);
+        }
+    }
+    #[tokio::test]
+    async fn pr_786_reconcile_absent_inherited_root_preserves_repo_ground() {
+        use crate::ipc::{
+            DaemonRequest, DaemonRequestPayload, DaemonResponse, GroundResult, IndexRequest,
+        };
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().canonicalize().expect("canonical tempdir");
+        let inherited = base.join("inherited");
+        let repo = base.join("repo");
+        let wiki = repo.join("wiki");
+        std::fs::create_dir_all(&inherited).expect("create inherited root");
+        std::fs::create_dir_all(&wiki).expect("create repo corpus");
+        std::fs::create_dir(repo.join(".git")).expect("create git boundary");
+        std::fs::create_dir(repo.join(".hallouminate")).expect("create repo config dir");
+        std::fs::write(wiki.join("note.md"), "# Note\n\npr786retainmarker\n")
+            .expect("write searchable note");
+        let config_path = repo.join(".hallouminate/config.toml");
+        std::fs::write(
+            &config_path,
+            "[[corpus]]\nname = \"local\"\npaths = [\"wiki\"]\nglobs = [\"**/*.md\"]\n",
+        )
+        .expect("write repo corpus config");
+
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.search.cold_wait_ms = 0;
+        cfg.storage.ground_dir = base.join("ground").to_string_lossy().into_owned();
+        let inherited_corpus = corpus("inherited", inherited.to_str().expect("utf8"), &["**/*.md"]);
+        cfg.corpora.push(inherited_corpus.clone());
+        let state = DaemonState::open(cfg.clone(), None).await.expect("open");
+        state.watch_registry().seed_baseline(
+            inherited_corpus.clone(),
+            std::sync::Arc::new(cfg.clone()),
+            watch_roots_for(&inherited_corpus),
+        );
+        let index = crate::dispatch::dispatch(
+            &state,
+            DaemonRequest {
+                cwd: repo.clone(),
+                payload: DaemonRequestPayload::Index(IndexRequest {
+                    corpus: Some("local".into()),
+                    paths_from: None,
+                    strict: false,
+                    background: false,
+                }),
+            },
+        )
+        .await;
+        let DaemonResponse::Ok { .. } = index else {
+            panic!("initial real index must succeed: {index:?}");
+        };
+        let (effective, _) =
+            hallouminate_config::resolve_for_cwd(&cfg, &repo, None).expect("resolve repo");
+        assert_eq!(
+            cfg.storage.ground_dir, effective.storage.ground_dir,
+            "storage binding"
+        );
+        assert_eq!(cfg.embeddings, effective.embeddings, "embedding binding");
+        assert!(
+            watch_roots_for(&inherited_corpus) == watch_roots_for(&effective.corpora[0]),
+            "inherited watch binding"
+        );
+        let ground = || async {
+            let response = crate::dispatch::dispatch(
+                &state,
+                DaemonRequest {
+                    cwd: repo.clone(),
+                    payload: DaemonRequestPayload::Ground(
+                        serde_json::from_value(serde_json::json!({
+                            "query": "pr786retainmarker",
+                            "corpus": "local",
+                            "match": "phrase",
+                        }))
+                        .expect("ground request"),
+                    ),
+                },
+            )
+            .await;
+            let DaemonResponse::Ok { result } = response else {
+                panic!("repo Ground must succeed: {response:?}");
+            };
+            let result: GroundResult = serde_json::from_value(result).expect("ground result");
+            assert_eq!(
+                result.response.docs.len(),
+                1,
+                "repo marker must remain searchable through real Ground: {:?}",
+                result.response
+            );
+            assert!(
+                result
+                    .response
+                    .docs
+                    .contains_key(&wiki.join("note.md").to_string_lossy().into_owned()),
+                "Ground must return the repo file, not an unrelated hit: {:?}",
+                result.response.docs
+            );
+        };
+        ground().await;
+
+        std::fs::remove_dir_all(&inherited).expect("remove ordinary inherited root");
+        let mut pump = PumpState::test_default();
+        let tracker = TaskTracker::new();
+        let mut memo = ReloadFailureMemo::new();
+        reconcile_ticks(
+            &state,
+            &mut pump,
+            &tracker,
+            &mut memo,
+            MISSING_ROOT_RETIRE_TICKS + 1,
+        );
+        ground().await;
+
+        let second = repo.join("second");
+        std::fs::create_dir(&second).expect("create second repo corpus");
+        std::fs::write(second.join("new.md"), "# New\n\npr786newmarker\n")
+            .expect("write second marker");
+        std::fs::write(
+            &config_path,
+            "[[corpus]]\nname = \"local\"\npaths = [\"wiki\"]\nglobs = [\"**/*.md\"]\n[[corpus]]\nname = \"second\"\npaths = [\"second\"]\nglobs = [\"**/*.md\"]\n",
+        )
+        .expect("edit repo config");
+        reconcile_ticks(&state, &mut pump, &tracker, &mut memo, 1);
+        assert!(
+            registered(&state, "second"),
+            "repo-layer reload must register the edited corpus before the next request"
+        );
+        let response = crate::dispatch::dispatch(
+            &state,
+            DaemonRequest {
+                cwd: repo.clone(),
+                payload: DaemonRequestPayload::Index(IndexRequest {
+                    corpus: Some("second".into()),
+                    paths_from: None,
+                    strict: false,
+                    background: false,
+                }),
+            },
+        )
+        .await;
+        let DaemonResponse::Ok { .. } = response else {
+            panic!("edited repo corpus must index: {response:?}");
+        };
+        let response = crate::dispatch::dispatch(
+            &state,
+            DaemonRequest {
+                cwd: repo.clone(),
+                payload: DaemonRequestPayload::Ground(
+                    serde_json::from_value(serde_json::json!({
+                        "query": "pr786newmarker",
+                        "corpus": "second",
+                        "match": "phrase",
+                    }))
+                    .expect("second ground request"),
+                ),
+            },
+        )
+        .await;
+        let DaemonResponse::Ok { result } = response else {
+            panic!("edited repo Ground must succeed: {response:?}");
+        };
+        let result: GroundResult = serde_json::from_value(result).expect("second ground result");
+        assert!(
+            result
+                .response
+                .docs
+                .contains_key(&second.join("new.md").to_string_lossy().into_owned()),
+            "edited repo corpus must be searchable: {:?}",
+            result.response.docs
+        );
+
+        let mut incompatible = cfg.clone();
+        incompatible.storage.ground_dir = tmp
+            .path()
+            .join("other-ground")
+            .to_string_lossy()
+            .into_owned();
+        let error = register_runtime_corpora(
+            &state,
+            Some(&config_path),
+            &[inherited_corpus],
+            &incompatible,
+        )
+        .err()
+        .expect("incompatible cross-source binding must fail");
+        assert!(
+            error.contains("incompatible watcher registration"),
+            "the cross-source guard must reject the binding: {error}"
+        );
+        tracker.close();
+        tracker.wait().await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn retired_root_clears_native_retry_after_kernel_unwatch() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (state, repo, root) = repo_layer_fixture(tmp.path()).await;
+        let mut pump = PumpState::test_default();
+        pump.debouncer = Some(
+            build_debouncer(
+                state.baseline(),
+                &state,
+                std::sync::Arc::new(tokio::sync::Notify::new()),
+                std::sync::Arc::new(std::sync::Mutex::new(PendingPaths::default())),
+                false,
+            )
+            .expect("open inotify"),
+        );
+        let tracker = TaskTracker::new();
+        pump.reconcile(&state, &tracker, WatchRetry::ReconcileTick);
+        assert!(
+            pump.installed.contains_key(&root),
+            "install the native watch"
+        );
+        std::fs::remove_dir_all(&repo).expect("delete repo");
+
+        let debouncer = pump.debouncer.as_ref().expect("debouncer");
+        crate::test_support::wait_until(Duration::from_secs(5), "inotify root removal", || async {
+            debouncer
+                .watched_paths()
+                .expect("read native watches")
+                .iter()
+                .all(|watch| watch.path != root)
+        })
+        .await;
+
+        let mut memo = ReloadFailureMemo::new();
+        reconcile_ticks(
+            &state,
+            &mut pump,
+            &tracker,
+            &mut memo,
+            MISSING_ROOT_RETIRE_TICKS - 1,
+        );
+        let sibling = repo.parent().expect("repo parent").join("sibling");
+        std::fs::create_dir(&sibling).expect("create sibling");
+        register_runtime_corpora(
+            &state,
+            None,
+            &[corpus(
+                "sibling",
+                sibling.to_str().expect("utf8"),
+                &["**/*.md"],
+            )],
+            state.baseline(),
+        )
+        .expect("register sibling");
+        reconcile_ticks(&state, &mut pump, &tracker, &mut memo, 1);
+        tracker.close();
+        tracker.wait().await;
+
+        let native_paths = pump
+            .debouncer
+            .as_ref()
+            .expect("debouncer")
+            .watched_paths()
+            .expect("read native watches");
+        assert!(
+            native_paths.iter().any(|watch| watch.path == sibling),
+            "install the watch that follows the removed root in the reconcile batch"
+        );
+        assert!(!registered(&state, "cheese"), "retire the missing root");
+        assert!(
+            !pump.installed.contains_key(&root),
+            "forget the removed watch"
+        );
+        assert!(
+            !pump.unwatch_retries.contains_key(&root),
+            "clear the obsolete retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn deleted_repo_layer_root_retires_after_consecutive_missing_ticks() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (state, repo, root) = repo_layer_fixture(tmp.path()).await;
+        let capture = LogCapture::default();
+        let guard = capture.install();
+        let mut pump = PumpState::test_default();
+        let tracker = TaskTracker::new();
+        let mut memo = ReloadFailureMemo::new();
+
+        std::fs::remove_dir_all(&repo).expect("delete repo");
+        reconcile_ticks(
+            &state,
+            &mut pump,
+            &tracker,
+            &mut memo,
+            MISSING_ROOT_RETIRE_TICKS - 1,
+        );
+        assert!(
+            registered(&state, "cheese"),
+            "a registration must survive fewer than the threshold of missing ticks"
+        );
+        reconcile_ticks(&state, &mut pump, &tracker, &mut memo, 1);
+        assert!(
+            !registered(&state, "cheese"),
+            "the registration must retire once its root stays missing for the threshold"
+        );
+        reconcile_ticks(&state, &mut pump, &tracker, &mut memo, 2);
+        drop(guard);
+        tracker.close();
+        tracker.wait().await;
+
+        let retired = capture.events(tracing::Level::INFO, RETIRED_MESSAGE);
+        assert_eq!(
+            retired.len(),
+            1,
+            "retirement must log exactly one info event"
+        );
+        assert_eq!(retired[0].get("corpus").map(String::as_str), Some("cheese"));
+        assert_eq!(
+            retired[0].get("root").map(String::as_str),
+            Some(root.to_str().unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn repo_layer_root_that_reappears_before_the_threshold_is_not_retired() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (state, repo, root) = repo_layer_fixture(tmp.path()).await;
+        let capture = LogCapture::default();
+        let guard = capture.install();
+        let mut pump = PumpState::test_default();
+        let tracker = TaskTracker::new();
+        let mut memo = ReloadFailureMemo::new();
+        let below = MISSING_ROOT_RETIRE_TICKS - 1;
+
+        std::fs::remove_dir_all(&repo).expect("delete repo");
+        reconcile_ticks(&state, &mut pump, &tracker, &mut memo, below);
+        std::fs::create_dir_all(&root).expect("recreate corpus root");
+        reconcile_ticks(
+            &state,
+            &mut pump,
+            &tracker,
+            &mut memo,
+            MISSING_ROOT_RETIRE_TICKS + 1,
+        );
+        assert!(
+            registered(&state, "cheese"),
+            "a root that exists must never retire"
+        );
+        std::fs::remove_dir_all(&repo).expect("delete repo again");
+        reconcile_ticks(&state, &mut pump, &tracker, &mut memo, below);
+        assert!(
+            registered(&state, "cheese"),
+            "a reappearing root must reset the missing-tick count"
+        );
+        drop(guard);
+        tracker.close();
+        tracker.wait().await;
+
+        assert!(
+            capture
+                .events(tracing::Level::INFO, RETIRED_MESSAGE)
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_baseline_root_retires_only_when_the_baseline_does_not_declare_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let declared_root = tmp.path().join("declared");
+        let discovered_root = tmp.path().join("discovered");
+        let declared = corpus("declared", declared_root.to_str().unwrap(), &["**/*.md"]);
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = tmp.path().join("ground").to_string_lossy().into_owned();
+        cfg.corpora = vec![declared];
+        let state = DaemonState::open(cfg.clone(), None).await.expect("open");
+        let baseline_cfg = std::sync::Arc::new(state.baseline().clone());
+        for corpus in state
+            .baseline()
+            .effective_corpora()
+            .expect("baseline corpora")
+        {
+            let roots = watch_roots_for(&corpus);
+            state
+                .watch_registry()
+                .seed_baseline(corpus, baseline_cfg.clone(), roots);
+        }
+        register_runtime_corpora(
+            &state,
+            None,
+            &[corpus(
+                "discovered",
+                discovered_root.to_str().unwrap(),
+                &["**/*.md"],
+            )],
+            &cfg,
+        )
+        .expect("register discovered");
+        let mut pump = PumpState::test_default();
+        let tracker = TaskTracker::new();
+        let mut memo = ReloadFailureMemo::new();
+
+        reconcile_ticks(
+            &state,
+            &mut pump,
+            &tracker,
+            &mut memo,
+            MISSING_ROOT_RETIRE_TICKS + 1,
+        );
+        tracker.close();
+        tracker.wait().await;
+
+        assert!(
+            registered(&state, "declared"),
+            "a declared baseline root must stay registered while absent"
+        );
+        assert!(
+            !registered(&state, "discovered"),
+            "an undeclared baseline root must retire once it stays missing"
+        );
+    }
+
+    #[tokio::test]
+    async fn retiring_a_registration_deletes_rows_under_every_watch_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp_path = tmp.path().canonicalize().expect("canonicalize tempdir");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = tmp_path.join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg.clone(), None).await.expect("open");
+        let repo = tmp_path.join("repo");
+        let first = tmp_path.join("first");
+        let second = tmp_path.join("second");
+        std::fs::create_dir_all(repo.join(".hallouminate")).expect("create config dir");
+        for (dir, name) in [(&first, "a.md"), (&second, "b.md")] {
+            std::fs::create_dir_all(dir).expect("create root");
+            std::fs::write(dir.join(name), "# Note\n\nbody\n").expect("write note");
+        }
+        let config_path = repo.join(".hallouminate").join("config.toml");
+        std::fs::write(&config_path, "").expect("write repo config");
+        let mut multi = corpus("multi", first.to_str().unwrap(), &["**/*.md"]);
+        multi.paths.push(second.to_string_lossy().into_owned());
+        let keys = multi.corpus_keys();
+        assert_eq!(keys.len(), 2, "the corpus must span two roots");
+        register_runtime_corpora(&state, Some(&config_path), &[multi], &cfg).expect("register");
+        let (id, _) = state
+            .watch_registry()
+            .snapshot_roots()
+            .into_iter()
+            .next()
+            .expect("registration root");
+        let mut pump = PumpState::test_default();
+        let tracker = TaskTracker::new();
+        pump.reconcile(&state, &tracker, WatchRetry::ReconcileTick);
+        crate::test_support::wait_until(Duration::from_secs(5), "initial catch-up", || async {
+            state.watch_registry().catch_up_state(&id) == Some(registry::CatchUpState::Done)
+        })
+        .await;
+        let resources = state.resources_for(&cfg).await.expect("resources");
+        for key in &keys {
+            let files = resources.store.list_files(key).await.expect("list files");
+            assert!(!files.is_empty(), "catch-up must index root {key:?}");
+        }
+
+        std::fs::remove_dir_all(&repo).expect("delete repo");
+        std::fs::remove_dir_all(&first).expect("delete first root");
+        std::fs::remove_dir_all(&second).expect("delete second root");
+        let mut memo = ReloadFailureMemo::new();
+        reconcile_ticks(
+            &state,
+            &mut pump,
+            &tracker,
+            &mut memo,
+            MISSING_ROOT_RETIRE_TICKS,
+        );
+        tracker.close();
+        tracker.wait().await;
+
+        assert!(!registered(&state, "multi"), "the registration must retire");
+        for key in &keys {
+            let files = resources.store.list_files(key).await.expect("list files");
+            assert!(
+                files.is_empty(),
+                "retirement must delete the rows stored under {key:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn retired_root_recreated_during_resource_setup_keeps_all_corpora() {
+        use hallouminate_domain::search::ChunkRetrieval;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (state, repo, root) = repo_layer_fixture(tmp.path()).await;
+        std::fs::write(root.join("note.md"), "# Note\n\nbody\n").expect("write root file");
+        let cfg = state.baseline().clone();
+        let resources = state.resources_for(&cfg).await.expect("resources");
+        let first = CorpusKey::from_configured_root("cheese", root.to_str().expect("utf8"));
+        let second = CorpusKey::from_configured_root("other", root.to_str().expect("utf8"));
+        for key in [&first, &second] {
+            seed_retired_root_rows(&resources.store, key).await;
+            let hits = resources
+                .store
+                .retrieve_signals(key, "body", 10)
+                .await
+                .expect("search seed");
+            assert_eq!(hits.fts.len(), 1, "seed must be searchable in {key:?}");
+            assert_eq!(
+                hits.hits[&hits.fts[0]].file_ref,
+                root.join("note.md").to_string_lossy()
+            );
+        }
+        let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+        let resume = std::sync::Arc::new(tokio::sync::Notify::new());
+        state.pause_next_resource_lookup(entered.clone(), resume.clone());
+        std::fs::remove_dir_all(&repo).expect("remove repo and root");
+        let tracker = TaskTracker::new();
+        for _ in 0..MISSING_ROOT_RETIRE_TICKS {
+            retire_missing_registrations(&state, &tracker);
+        }
+        assert!(!registered(&state, "cheese"), "registration must retire");
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("retired cleanup did not request resources");
+        std::fs::create_dir_all(&root).expect("recreate root");
+        std::fs::write(root.join("note.md"), "# Note\n\nbody\n").expect("recreate root file");
+        let unrelated_root = tmp.path().join("unrelated");
+        let unrelated =
+            CorpusKey::from_configured_root("unrelated", unrelated_root.to_str().expect("utf8"));
+        let write = tokio::time::timeout(Duration::from_secs(2), async {
+            let _guard = state
+                .acquire_mutation_guard(std::slice::from_ref(&unrelated))
+                .await
+                .expect("unrelated mutation admission");
+            seed_retired_root_rows(&resources.store, &unrelated).await;
+        })
+        .await;
+        resume.notify_one();
+        tracker.close();
+        tracker.wait().await;
+        for key in [&first, &second] {
+            let hits = resources
+                .store
+                .retrieve_signals(key, "body", 10)
+                .await
+                .expect("search retained rows");
+            assert_eq!(
+                hits.fts.len(),
+                1,
+                "returning root must keep searchable rows in {key:?}"
+            );
+            assert_eq!(
+                hits.hits[&hits.fts[0]].file_ref,
+                root.join("note.md").to_string_lossy()
+            );
+        }
+        assert!(
+            write.is_ok(),
+            "unrelated store write must complete while resources wait"
+        );
+        let hits = resources
+            .store
+            .retrieve_signals(&unrelated, "body", 10)
+            .await
+            .expect("search unrelated write");
+        assert!(!hits.fts.is_empty(), "unrelated write must be searchable");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn vanished_symlink_ancestor_keeps_the_canonical_retirement_key() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (state, _repo, _root) = repo_layer_fixture(tmp.path()).await;
+        let physical = tmp
+            .path()
+            .canonicalize()
+            .expect("canonical tempdir")
+            .join("physical");
+        let root = physical.join("watched");
+        std::fs::create_dir_all(&root).expect("create physical root");
+        std::fs::write(root.join("note.md"), "# Note\n\nbody\n").expect("write watched note");
+        let alias_parent = tmp.path().join("alias-parent");
+        std::fs::create_dir_all(&alias_parent).expect("create alias parent");
+        symlink(&physical, alias_parent.join("linked")).expect("link physical root");
+        let alias = alias_parent.join("linked/watched");
+        let selected = corpus("alias", alias.to_str().expect("utf8"), &["**/*.md"]);
+        let cfg = state.baseline().clone();
+        let source = registry::ConfigSource::RepoLayer(tmp.path().join("alias-config.toml"));
+        state.watch_registry().register(
+            source.clone(),
+            selected.clone(),
+            std::sync::Arc::new(cfg.clone()),
+            watch_roots_for(&selected),
+        );
+        let (before, _) = state
+            .watch_registry()
+            .snapshot_roots()
+            .into_iter()
+            .find(|(id, _)| id.corpus_key.name == "alias")
+            .expect("alias registration");
+        assert_eq!(before.corpus_key.canonical_root, root);
+        let resources = state.resources_for(&cfg).await.expect("resources");
+        seed_retired_root_rows(&resources.store, &before.corpus_key).await;
+
+        std::fs::remove_dir_all(&alias_parent).expect("remove symlink ancestor");
+        state.watch_registry().refresh_roots(watch_roots_for);
+        let (after, _) = state
+            .watch_registry()
+            .snapshot_roots()
+            .into_iter()
+            .find(|(id, _)| id.corpus_key.name == "alias")
+            .expect("alias registration after refresh");
+        assert_eq!(
+            after.corpus_key, before.corpus_key,
+            "missing alias must not rekey stored rows"
+        );
+        std::fs::remove_dir_all(&physical).expect("remove physical root");
+        let mut retired = state
+            .watch_registry()
+            .replace_source(source, vec![], std::sync::Arc::new(cfg), watch_roots_for)
+            .expect("replace source");
+        assert_eq!(retired.len(), 1);
+        assert_eq!(retired[0].roots[0], root);
+        assert!(
+            cleanup_retired_registration(&state, retired.pop().expect("retired alias"))
+                .await
+                .is_none()
+        );
+        let stats = resources
+            .store
+            .corpus_chunk_stats(&before.corpus_key)
+            .await
+            .expect("stats");
+        assert_eq!(
+            stats.total_chunks, 0,
+            "retirement must delete rows under the original canonical key"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retargeted_alias_does_not_keep_old_canonical_rows() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (state, _repo, _root) = repo_layer_fixture(tmp.path()).await;
+        let old_physical = tmp
+            .path()
+            .canonicalize()
+            .expect("canonical tempdir")
+            .join("old-physical");
+        let old_root = old_physical.join("watched");
+        let new_physical = tmp.path().join("new-physical");
+        std::fs::create_dir_all(&old_root).expect("create old root");
+        std::fs::create_dir_all(new_physical.join("watched")).expect("create new root");
+        let alias_link = tmp.path().join("linked");
+        symlink(&old_physical, &alias_link).expect("link old root");
+        let alias = alias_link.join("watched");
+        let selected = corpus("alias", alias.to_str().expect("utf8"), &["**/*.md"]);
+        let cfg = state.baseline().clone();
+        let source = registry::ConfigSource::RepoLayer(tmp.path().join("alias-config.toml"));
+        state.watch_registry().register(
+            source.clone(),
+            selected.clone(),
+            std::sync::Arc::new(cfg.clone()),
+            watch_roots_for(&selected),
+        );
+        let (before, _) = state
+            .watch_registry()
+            .snapshot_roots()
+            .into_iter()
+            .find(|(id, _)| id.corpus_key.name == "alias")
+            .expect("alias registration");
+        assert_eq!(before.corpus_key.canonical_root, old_root);
+        let resources = state.resources_for(&cfg).await.expect("resources");
+        seed_retired_root_rows(&resources.store, &before.corpus_key).await;
+
+        std::fs::remove_file(&alias_link).expect("unlink old alias");
+        symlink(&new_physical, &alias_link).expect("retarget alias");
+        std::fs::remove_dir_all(&old_physical).expect("remove old root");
+        let mut retired = state
+            .watch_registry()
+            .replace_source(source, vec![], std::sync::Arc::new(cfg), watch_roots_for)
+            .expect("replace source");
+        assert_eq!(retired.len(), 1);
+        assert_eq!(retired[0].roots[0], old_root);
+        assert!(
+            cleanup_retired_registration(&state, retired.pop().expect("retired alias"))
+                .await
+                .is_none()
+        );
+        let stats = resources
+            .store
+            .corpus_chunk_stats(&before.corpus_key)
+            .await
+            .expect("stats");
+        assert_eq!(
+            stats.total_chunks, 0,
+            "retargeted alias must not keep old rows"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn indeterminate_root_stat_retries_config_replacement_cleanup() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (state, _repo, _root) = repo_layer_fixture(tmp.path()).await;
+        let loop_path = tmp.path().join("loop");
+        symlink(&loop_path, &loop_path).expect("create symlink loop");
+        let root = loop_path.join("child");
+        let selected = corpus("loop", root.to_str().expect("utf8"), &["**/*.md"]);
+        let cfg = state.baseline().clone();
+        let source = registry::ConfigSource::RepoLayer(tmp.path().join("loop-config.toml"));
+        state.watch_registry().register(
+            source.clone(),
+            selected.clone(),
+            std::sync::Arc::new(cfg.clone()),
+            watch_roots_for(&selected),
+        );
+        let key = CorpusKey::from_configured_root("loop", root.to_str().expect("utf8"));
+        let resources = state.resources_for(&cfg).await.expect("resources");
+        seed_retired_root_rows(&resources.store, &key).await;
+        let mut retired = state
+            .watch_registry()
+            .replace_source(source, vec![], std::sync::Arc::new(cfg), watch_roots_for)
+            .expect("replace source");
+        assert_eq!(retired.len(), 1);
+        let pending = cleanup_retired_registration(&state, retired.pop().expect("retired loop"))
+            .await
+            .expect("indeterminate stat must retry");
+        let stats = resources
+            .store
+            .corpus_chunk_stats(&key)
+            .await
+            .expect("stats");
+        assert_eq!(stats.total_chunks, 1, "indeterminate stat must retain rows");
+
+        std::fs::remove_file(&loop_path).expect("remove symlink loop");
+        assert!(
+            cleanup_retired_registration(&state, pending)
+                .await
+                .is_none()
+        );
+        let stats = resources
+            .store
+            .corpus_chunk_stats(&key)
+            .await
+            .expect("stats");
+        assert_eq!(
+            stats.total_chunks, 0,
+            "a later NotFound proof must delete rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn retired_root_cleanup_waits_for_mutation_admission() {
+        use crate::debt::{DebtLevel, OBSERVED, OBSERVED_HARD_COORD};
+
+        let _coord = OBSERVED_HARD_COORD.write().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().canonicalize().expect("canonicalize tempdir");
+        let root = path.join("gone");
+        let key = CorpusKey::from_configured_root("gone", root.to_str().expect("utf8"));
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = path.join("ground").to_string_lossy().into_owned();
+        cfg.daemon.maintenance_interval_secs = 3600;
+        cfg.daemon.debt_hard_fragments = 1;
+        cfg.daemon.debt_cache_ttl_secs = 0;
+        cfg.daemon.hard_block_wait_secs = 0;
+
+        let state = DaemonState::open(cfg.clone(), None).await.expect("open");
+        let resources = state.resources_for(&cfg).await.expect("resources");
+        seed_retired_root_rows(&resources.store, &key).await;
+        let retired = registry::RetiredRegistration {
+            corpus: "gone".into(),
+            root: root.clone(),
+            roots: vec![root.clone()],
+            lock_keys: vec![key.clone()],
+            cfg: std::sync::Arc::new(cfg),
+            failed_attempts: 0,
+            detached: None,
+            ordinary_owner: None,
+            log_missing_root: false,
+            waiting_roots: Vec::new(),
+            _permit: Some(
+                std::sync::Arc::new(tokio::sync::Semaphore::new(1))
+                    .try_acquire_owned()
+                    .expect("cleanup slot"),
+            ),
+            _ticket: None,
+        };
+
+        let pending = cleanup_retired_registration(&state, retired).await;
+        OBSERVED.record(DebtLevel::Ok);
+        let stats = resources
+            .store
+            .corpus_chunk_stats(&key)
+            .await
+            .expect("stats");
+        assert_eq!(
+            stats.total_chunks, 1,
+            "Hard debt must preserve the indexed row"
+        );
+        let pending = pending.expect("Hard debt must defer cleanup");
+        assert_eq!(pending.roots[0], root);
+    }
+
+    async fn seed_retired_root_rows(store: &LanceStore, key: &CorpusKey) {
+        store
+            .apply_batch(vec![hallouminate_domain::indexer::PreparedFile {
+                file_ref: key
+                    .canonical_root
+                    .join("note.md")
+                    .to_string_lossy()
+                    .into_owned(),
+                corpus_key: key.clone(),
+                mtime_ms: 1,
+                content_hash: "deadbeef".into(),
+                summary: "summary".into(),
+                keywords: vec![],
+                frontmatter: None,
+                indexed_at_ms: 1,
+                chunks: vec![hallouminate_domain::indexer::PreparedChunk {
+                    ord: 0,
+                    heading_path: vec!["H".into()],
+                    line_start: 1,
+                    line_end: 2,
+                    text: "body".into(),
+                    search_text: "body".into(),
+                    claim_marks: None,
+                    structure: None,
+                    overlap_bytes: 0,
+                }],
+            }])
+            .await
+            .expect("seed retired root rows");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pr_786_reconcile_parked_eloop_cleanups_do_not_starve_real_retirement() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let base = temp.path().canonicalize().expect("canonical tempdir");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = base.join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg.clone(), None).await.expect("open");
+        let resources = state.resources_for(&cfg).await.expect("resources");
+        let source = registry::ConfigSource::RepoLayer(base.join("removed-config.toml"));
+        let mut blocked = Vec::new();
+
+        for number in 0..64 {
+            let parent = base.join(format!("loop-{number}"));
+            let root = parent.join("watched");
+            std::fs::create_dir_all(&root).expect("create root before retirement");
+            let selected = corpus(
+                &format!("blocked-{number}"),
+                root.to_str().expect("utf8"),
+                &["**/*.md"],
+            );
+            let key = selected.corpus_keys().remove(0);
+            assert_eq!(
+                state.watch_registry().register(
+                    source.clone(),
+                    selected.clone(),
+                    std::sync::Arc::new(cfg.clone()),
+                    watch_roots_for(&selected),
+                ),
+                registry::RegisterOutcome::New
+            );
+            seed_retired_root_rows(&resources.store, &key).await;
+            blocked.push((parent, root, key));
+        }
+        let retired = state
+            .watch_registry()
+            .replace_source(
+                source,
+                vec![],
+                std::sync::Arc::new(cfg.clone()),
+                watch_roots_for,
+            )
+            .expect("remove blocked config entries");
+        assert_eq!(
+            retired.len(),
+            64,
+            "fill every cleanup permit through real retirement"
+        );
+        for (parent, root, _) in &blocked {
+            std::fs::remove_dir_all(parent).expect("remove indexed root");
+            symlink(parent, parent).expect("replace ancestor with self-symlink");
+            assert_eq!(
+                std::fs::metadata(root)
+                    .expect_err("self-symlink must fail")
+                    .raw_os_error(),
+                Some(libc::ELOOP),
+                "persistent path failure must be ELOOP, not absence"
+            );
+        }
+        for registration in retired {
+            let failed = cleanup_retired_registration(&state, registration)
+                .await
+                .expect("ELOOP must keep cleanup pending");
+            state.watch_registry().park_failed_cleanup(failed);
+        }
+
+        let good_root = base.join("legitimate");
+        std::fs::create_dir(&good_root).expect("create legitimate worktree");
+        let good = corpus(
+            "legitimate",
+            good_root.to_str().expect("utf8"),
+            &["**/*.md"],
+        );
+        let good_key = good.corpus_keys().remove(0);
+        std::fs::create_dir(good_root.join(".git")).expect("create legitimate git boundary");
+        std::fs::create_dir(good_root.join(".hallouminate")).expect("create legitimate config dir");
+        let good_config = good_root.join(".hallouminate/config.toml");
+        std::fs::write(
+            &good_config,
+            "[[corpus]]\nname = \"legitimate\"\npaths = [\".\"]\n",
+        )
+        .expect("write legitimate repo config");
+        let good_source = registry::ConfigSource::RepoLayer(good_config);
+        assert_eq!(
+            state.watch_registry().register(
+                good_source.clone(),
+                good.clone(),
+                std::sync::Arc::new(cfg.clone()),
+                watch_roots_for(&good),
+            ),
+            registry::RegisterOutcome::New
+        );
+        seed_retired_root_rows(&resources.store, &good_key).await;
+        assert_eq!(
+            resources
+                .store
+                .corpus_chunk_stats(&good_key)
+                .await
+                .expect("seed stats")
+                .total_chunks,
+            1,
+            "legitimate worktree must have durable rows before removal"
+        );
+        std::fs::remove_dir_all(&good_root).expect("remove legitimate worktree");
+        assert!(
+            registered(&state, "legitimate"),
+            "missing root must remain registered until reconciliation"
+        );
+
+        let mut pump = PumpState::test_default();
+        let mut memo = ReloadFailureMemo::new();
+        for _ in 0..4 {
+            let tracker = TaskTracker::new();
+            run_reconcile_tick(&state, &mut pump, &tracker, &mut memo);
+            tracker.close();
+            tracker.wait().await;
+        }
+        assert!(
+            !registered(&state, "legitimate"),
+            "a confirmed-absent worktree must retire while ELOOP failures persist"
+        );
+        assert_eq!(
+            resources
+                .store
+                .corpus_chunk_stats(&good_key)
+                .await
+                .expect("good stats")
+                .total_chunks,
+            0,
+            "legitimate worktree's indexed rows must be deleted"
+        );
+
+        std::fs::remove_file(&blocked[0].0).expect("unblock one ELOOP ancestor");
+        let tracker = TaskTracker::new();
+        run_reconcile_tick(&state, &mut pump, &tracker, &mut memo);
+        tracker.close();
+        tracker.wait().await;
+        assert_eq!(
+            resources
+                .store
+                .corpus_chunk_stats(&blocked[0].2)
+                .await
+                .expect("unblocked stats")
+                .total_chunks,
+            0,
+            "confirmed absence after ELOOP must delete old canonical rows"
+        );
+        assert_eq!(
+            resources
+                .store
+                .corpus_chunk_stats(&blocked[1].2)
+                .await
+                .expect("still blocked stats")
+                .total_chunks,
+            1,
+            "other failed roots must keep their indexed rows"
+        );
+        let pending = state.watch_registry().take_pending_cleanups();
+        assert_eq!(
+            pending.len(),
+            63,
+            "failed roots must remain retryable and bounded"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_retired_cleanup_is_retried_on_the_next_reconcile_tick() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (state, _repo, _root) = repo_layer_fixture(tmp.path()).await;
+        let blocker = tmp.path().join("blocker");
+        std::fs::write(&blocker, "not a directory").expect("write blocker file");
+        let mut broken_cfg = hallouminate_config::Config::default();
+        broken_cfg.embeddings.enabled = false;
+        broken_cfg.storage.ground_dir = blocker.join("ground").to_string_lossy().into_owned();
+        let broken = std::sync::Arc::new(broken_cfg);
+        let retired = registry::RetiredRegistration {
+            corpus: "gone".into(),
+            root: tmp.path().join("gone"),
+            roots: vec![tmp.path().join("gone")],
+            lock_keys: Vec::new(),
+            cfg: std::sync::Arc::clone(&broken),
+            failed_attempts: 0,
+            detached: None,
+            ordinary_owner: None,
+            log_missing_root: false,
+            waiting_roots: Vec::new(),
+            _permit: Some(
+                std::sync::Arc::new(tokio::sync::Semaphore::new(1))
+                    .try_acquire_owned()
+                    .expect("cleanup slot"),
+            ),
+            _ticket: None,
+        };
+
+        let failed = cleanup_retired_registration(&state, retired)
+            .await
+            .expect("cleanup against unusable storage must report retry work");
+        assert_eq!(failed.roots[0], tmp.path().join("gone"));
+        state.watch_registry().park_failed_cleanup(failed);
+
+        std::fs::remove_file(&blocker).expect("remove blocker");
+        let key = hallouminate_domain::common::CorpusKey::from_configured_root(
+            "gone",
+            tmp.path().join("gone").to_str().expect("utf8"),
+        );
+        let resources = state.resources_for(&broken).await.expect("resources");
+        seed_retired_root_rows(&resources.store, &key).await;
+        let seeded = resources
+            .store
+            .corpus_chunk_stats(&key)
+            .await
+            .expect("stats");
+        assert_eq!(seeded.total_chunks, 1, "seed must create rows to delete");
+        let mut pump = PumpState::test_default();
+        let tracker = TaskTracker::new();
+        let mut memo = ReloadFailureMemo::new();
+        reconcile_ticks(&state, &mut pump, &tracker, &mut memo, 1);
+        tracker.close();
+        tracker.wait().await;
+
+        assert!(
+            state.watch_registry().take_pending_cleanups().is_empty(),
+            "the next tick must retry the parked cleanup and clear it once storage works"
+        );
+        let after = resources
+            .store
+            .corpus_chunk_stats(&key)
+            .await
+            .expect("stats");
+        assert_eq!(
+            after.total_chunks, 0,
+            "the retry must delete the retired root's rows"
+        );
+    }
+
+    #[test]
+    fn reload_failure_memo_forgets_paths_that_are_no_longer_sources() {
+        let mut memo = ReloadFailureMemo::new();
+        let path = PathBuf::from("/repo/.hallouminate/config.toml");
+        assert!(memo.record_failure(&path, "bad"));
+        assert!(!memo.record_failure(&path, "bad"));
+
+        memo.retain_sources(&[]);
+
+        assert!(
+            memo.record_failure(&path, "bad"),
+            "a re-registered path must warn again after its memo was dropped"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn repeated_symlink_events_warn_once_per_coalescing_window() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = tmp.path().join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg, None).await.expect("open");
+        let corpus_dir = tmp.path().join("wiki");
+        std::fs::create_dir_all(&corpus_dir).expect("mkdir corpus");
+        let corpus_dir = corpus_dir.canonicalize().expect("canonicalize corpus dir");
+        let outside = tmp.path().join("outside.md");
+        std::fs::write(&outside, "# Outside\n").expect("write outside");
+        let note = corpus_dir.join("note.md");
+        std::os::unix::fs::symlink(&outside, &note).expect("symlink note -> outside");
+        let roots = vec![watch_root(
+            corpus_dir.to_str().unwrap(),
+            corpus("wiki", corpus_dir.to_str().unwrap(), &["**/*.md"]),
+            None,
+        )];
+        let mut failures = FailureCoalescer::new(Duration::from_secs(60), MAX_FAILURE_SIGNATURES);
+        let mut churn = disabled_churn();
+        let capture = LogCapture::default();
+        let guard = capture.install();
+
+        for _ in 0..5 {
+            handle_changed_path(&state, &roots, &note, &mut failures, &mut churn).await;
+        }
+        drop(guard);
+
+        let warns = capture.events(
+            tracing::Level::WARN,
+            "watcher: skipping reindex, no-follow read failed",
+        );
+        assert_eq!(
+            warns.len(),
+            1,
+            "five events on one symlinked file must warn once per window"
+        );
+    }
+    async fn pr_786_followup_index_contains(
+        state: &DaemonState,
+        corpus: &CorpusConfig,
+        marker: &str,
+        file: &Path,
+    ) -> bool {
+        use hallouminate_domain::ground::GroundMatch;
+        use hallouminate_domain::ground::{GroundOpts, ground_union};
+
+        let response = ground_union(
+            marker,
+            std::slice::from_ref(corpus),
+            state.store().as_ref(),
+            None,
+            GroundOpts {
+                match_mode: GroundMatch::Phrase,
+                ..GroundOpts::default()
+            },
+            None,
+        )
+        .await
+        .expect("Lance phrase query");
+        response
+            .docs
+            .contains_key(&file.to_string_lossy().into_owned())
+    }
+
+    #[tokio::test]
+    async fn pr_786_retirement_followup_real_probe_replacement_needs_own_ticks() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().canonicalize().expect("canonical tempdir");
+        let old_root = base.join("old");
+        let new_root = base.join("new");
+        std::fs::create_dir(&old_root).expect("old root");
+        std::fs::create_dir(&new_root).expect("new root");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = base.join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg.clone(), None).await.expect("open");
+        let source = ConfigSource::RepoLayer(base.join("missing-config.toml"));
+        let original = corpus("wiki", old_root.to_str().expect("utf8"), &["**/*.md"]);
+        assert_eq!(
+            state.watch_registry().register(
+                source.clone(),
+                original.clone(),
+                std::sync::Arc::new(cfg.clone()),
+                watch_roots_for(&original)
+            ),
+            registry::RegisterOutcome::New
+        );
+        let id = state.watch_registry().snapshot_roots()[0].0.clone();
+        std::fs::remove_dir(&old_root).expect("remove old root");
+        let stale = collect_root_observations(&state);
+        let mut replacement = original;
+        replacement
+            .paths
+            .push(new_root.to_string_lossy().into_owned());
+        assert_eq!(
+            state.watch_registry().register(
+                source,
+                replacement.clone(),
+                std::sync::Arc::new(cfg),
+                watch_roots_for(&replacement)
+            ),
+            registry::RegisterOutcome::New
+        );
+        assert!(
+            state
+                .watch_registry()
+                .record_absent_roots(&stale, 3)
+                .is_empty()
+        );
+        assert!(
+            state.watch_registry().observation(&id).is_some(),
+            "old real probe cannot retire replacement"
+        );
+        std::fs::remove_dir(&new_root).expect("remove new root");
+        for _ in 0..2 {
+            let current = collect_root_observations(&state);
+            assert!(
+                state
+                    .watch_registry()
+                    .record_absent_roots(&current, 3)
+                    .is_empty()
+            );
+            assert!(
+                state.watch_registry().observation(&id).is_some(),
+                "replacement has fewer than three eligible ticks"
+            );
+        }
+        let current = collect_root_observations(&state);
+        let retired = state.watch_registry().record_absent_roots(&current, 3);
+        assert_eq!(retired.len(), 1, "third replacement tick retires it");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pr_786_retirement_followup_retargeted_alias_survives_third_tick() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().canonicalize().expect("canonical tempdir");
+        let repo = base.join("repo");
+        let old_root = repo.join("old");
+        let new_root = repo.join("new");
+        std::fs::create_dir_all(&repo).expect("repo");
+        std::fs::create_dir_all(&old_root).expect("old root");
+        std::fs::create_dir_all(&new_root).expect("new root");
+        std::fs::create_dir(repo.join(".git")).expect("git boundary");
+        std::fs::create_dir(repo.join(".hallouminate")).expect("config dir");
+        let alias = repo.join("alias");
+        symlink(&old_root, &alias).expect("alias old root");
+        let config_path = repo.join(".hallouminate/config.toml");
+        std::fs::write(
+            &config_path,
+            "[[corpus]]\nname = \"alias\"\npaths = [\"alias\"]\nglobs = [\"**/*.md\"]\n",
+        )
+        .expect("config");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = base.join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg.clone(), None).await.expect("open");
+        let (effective, _) =
+            hallouminate_config::resolve_for_cwd(&cfg, &repo, None).expect("resolve");
+        register_runtime_corpora(&state, Some(&config_path), &effective.corpora, &effective)
+            .expect("register");
+        assert!(registered(&state, "alias"), "declared alias must register");
+        let mut pump = PumpState::test_default();
+        let tracker = TaskTracker::new();
+        let mut memo = ReloadFailureMemo::new();
+        reconcile_ticks(&state, &mut pump, &tracker, &mut memo, 1);
+        tracker.close();
+        tracker.wait().await;
+        std::fs::remove_file(&config_path).expect("remove config");
+        std::fs::remove_file(&alias).expect("unlink alias");
+        std::fs::remove_dir_all(&old_root).expect("remove old root");
+        for tick in 0..2 {
+            let tracker = TaskTracker::new();
+            reconcile_ticks(&state, &mut pump, &tracker, &mut memo, 1);
+            tracker.close();
+            tracker.wait().await;
+            assert!(
+                registered(&state, "alias"),
+                "registration remains before third tick: {tick}"
+            );
+        }
+        symlink(&new_root, &alias).expect("retarget alias");
+        let tracker = TaskTracker::new();
+        reconcile_ticks(&state, &mut pump, &tracker, &mut memo, 1);
+        tracker.close();
+        tracker.wait().await;
+        assert!(
+            registered(&state, "alias"),
+            "live declared alias resets absence"
+        );
+        assert!(
+            pump.roots
+                .iter()
+                .any(|root| root.canonical_watched == new_root),
+            "pump targets the new physical root"
+        );
+        let note = new_root.join("retargeted.md");
+        std::fs::write(&note, "# Retargeted\n\npr786retargetedalive\n").expect("write new note");
+        let mut failures = disabled_coalescer();
+        let mut churn = disabled_churn();
+        process_change_batch(
+            &state,
+            &pump.roots,
+            vec![note.clone()],
+            &mut failures,
+            &mut churn,
+        )
+        .await;
+        let selected = corpus("alias", alias.to_str().expect("utf8"), &["**/*.md"]);
+        assert!(
+            pr_786_followup_index_contains(&state, &selected, "pr786retargetedalive", &note).await,
+            "retargeted file follows the live event route"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pr_786_followup_existing_corpus_updates_at_capacity() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().canonicalize().expect("canonical tempdir");
+        let repo = base.join("repo");
+        let docs = repo.join("docs");
+        std::fs::create_dir_all(&docs).expect("create docs");
+        std::fs::create_dir(repo.join(".git")).expect("git boundary");
+        std::fs::create_dir(repo.join(".hallouminate")).expect("config dir");
+        let config_path = repo.join(".hallouminate/config.toml");
+        std::fs::write(
+            &config_path,
+            "[[corpus]]\nname = \"existing\"\npaths = [\"docs\"]\nglobs = [\"**/*.md\"]\n",
+        )
+        .expect("initial config");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = base.join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg.clone(), None).await.expect("open");
+        let (effective, _) =
+            hallouminate_config::resolve_for_cwd(&cfg, &repo, None).expect("resolve repo");
+        register_runtime_corpora(&state, Some(&config_path), &effective.corpora, &effective)
+            .expect("initial registration");
+        for number in 0..255 {
+            let selected = corpus(
+                &format!("synthetic-{number}"),
+                base.join(format!("synthetic-{number}"))
+                    .to_str()
+                    .expect("utf8"),
+                &["**/*.md"],
+            );
+            assert_eq!(
+                state.watch_registry().register(
+                    ConfigSource::RepoLayer(base.join(format!("other-{number}.toml"))),
+                    selected,
+                    std::sync::Arc::new(cfg.clone()),
+                    vec![],
+                ),
+                registry::RegisterOutcome::New
+            );
+        }
+        let added = repo.join("extra");
+        std::fs::create_dir(&added).expect("create extra");
+        std::fs::write(
+            &config_path,
+            "[[corpus]]\nname = \"extra\"\npaths = [\"extra\"]\nglobs = [\"**/*.md\"]\n",
+        )
+        .expect("temporarily remove existing while over capacity");
+        let defer_tracker = TaskTracker::new();
+        let mut defer_memo = ReloadFailureMemo::new();
+        reload_repo_layer(&state, &config_path, &defer_tracker, &mut defer_memo);
+        assert!(
+            !registered(&state, "existing"),
+            "old binding is deferred for retirement"
+        );
+        defer_tracker.close();
+        defer_tracker.wait().await;
+        std::fs::write(
+            &config_path,
+            "[[corpus]]\nname = \"existing\"\npaths = [\"docs\"]\nglobs = [\"**/*.md\", \"**/*.txt\"]\n[[corpus]]\nname = \"extra\"\npaths = [\"extra\"]\nglobs = [\"**/*.md\"]\n",
+        )
+        .expect("valid edit");
+        let mut pump = PumpState::test_default();
+        let tracker = TaskTracker::new();
+        let mut memo = ReloadFailureMemo::new();
+        reconcile_ticks(&state, &mut pump, &tracker, &mut memo, 1);
+        tracker.close();
+        tracker.wait().await;
+        let tracker = TaskTracker::new();
+        assert!(
+            !registered(&state, "extra"),
+            "new ID must wait for capacity"
+        );
+        let note = docs.join("updated.txt");
+        std::fs::write(&note, "# Updated\n\npr786followupcapacity\n").expect("write text");
+        let mut failures = disabled_coalescer();
+        let mut churn = disabled_churn();
+        process_change_batch(
+            &state,
+            &pump.roots,
+            vec![note.clone()],
+            &mut failures,
+            &mut churn,
+        )
+        .await;
+        let updated = corpus(
+            "existing",
+            docs.to_str().expect("utf8"),
+            &["**/*.md", "**/*.txt"],
+        );
+        assert!(
+            pr_786_followup_index_contains(&state, &updated, "pr786followupcapacity", &note).await,
+            "existing ID must apply its valid glob edit through the live event path"
+        );
+        let removed = state
+            .watch_registry()
+            .replace_source(
+                ConfigSource::RepoLayer(base.join("other-0.toml")),
+                vec![],
+                std::sync::Arc::new(cfg.clone()),
+                watch_roots_for,
+            )
+            .expect("retire one synthetic ID");
+        assert_eq!(removed.len(), 1, "one runtime slot must retire");
+        for registration in removed {
+            assert!(
+                cleanup_retired_registration(&state, registration)
+                    .await
+                    .is_none(),
+                "the synthetic root has no rows to retain"
+            );
+        }
+        reconcile_ticks(&state, &mut pump, &tracker, &mut memo, 1);
+        tracker.close();
+        tracker.wait().await;
+        let tracker = TaskTracker::new();
+        assert!(
+            registered(&state, "extra"),
+            "retry must admit the deferred ID"
+        );
+        let extra_note = added.join("new.md");
+        std::fs::write(&extra_note, "# New\n\npr786followupadmitted\n").expect("write extra note");
+        process_change_batch(
+            &state,
+            &pump.roots,
+            vec![extra_note.clone()],
+            &mut failures,
+            &mut churn,
+        )
+        .await;
+        let extra = corpus("extra", added.to_str().expect("utf8"), &["**/*.md"]);
+        assert!(
+            pr_786_followup_index_contains(&state, &extra, "pr786followupadmitted", &extra_note)
+                .await,
+            "the admitted ID must receive live events"
+        );
+        tracker.close();
+        tracker.wait().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pr_786_retirement_followup_invalid_retry_source_recovers() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().canonicalize().expect("canonical tempdir");
+        let repo = base.join("repo");
+        let docs = repo.join("docs");
+        std::fs::create_dir_all(&docs).expect("docs");
+        std::fs::create_dir(repo.join(".git")).expect("git boundary");
+        std::fs::create_dir(repo.join(".hallouminate")).expect("config dir");
+        let config_path = repo.join(".hallouminate/config.toml");
+        let valid =
+            "[[corpus]]\nname = \"retry-only\"\npaths = [\"docs\"]\nglobs = [\"**/*.md\"]\n";
+        std::fs::write(&config_path, valid).expect("config");
+        let note = docs.join("note.md");
+        std::fs::write(&note, "# Note\n\npr786retryonlyrecovered\n").expect("note");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = base.join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg.clone(), None).await.expect("open");
+        for number in 0..256 {
+            let selected = corpus(
+                &format!("synthetic-{number}"),
+                base.join(format!("synthetic-{number}"))
+                    .to_str()
+                    .expect("utf8"),
+                &["**/*.md"],
+            );
+            assert_eq!(
+                state.watch_registry().register(
+                    ConfigSource::RepoLayer(base.join(format!("other-{number}.toml"))),
+                    selected,
+                    std::sync::Arc::new(cfg.clone()),
+                    vec![],
+                ),
+                registry::RegisterOutcome::New
+            );
+        }
+        let tracker = TaskTracker::new();
+        let mut memo = ReloadFailureMemo::new();
+        reload_repo_layer(&state, &config_path, &tracker, &mut memo);
+        assert!(!registered(&state, "retry-only"));
+        assert!(
+            state
+                .watch_registry()
+                .repo_layer_sources()
+                .contains(&config_path)
+        );
+        std::fs::write(&config_path, "[[corpus]\n").expect("invalid config");
+        let mut pump = PumpState::test_default();
+        reconcile_ticks(&state, &mut pump, &tracker, &mut memo, 1);
+        assert!(
+            state
+                .watch_registry()
+                .repo_layer_sources()
+                .contains(&config_path),
+            "invalid config must not lose retry-only source"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            std::fs::remove_file(&config_path).expect("remove malformed config");
+            symlink(&config_path, &config_path).expect("create ELOOP config path");
+            reload_repo_layer(&state, &config_path, &tracker, &mut memo);
+            assert!(
+                state
+                    .watch_registry()
+                    .repo_layer_sources()
+                    .contains(&config_path),
+                "indeterminate config stat must retain retry-only source"
+            );
+            std::fs::remove_file(&config_path).expect("remove ELOOP symlink");
+        }
+        let gone_config = repo.join(".hallouminate/gone.toml");
+        let gone_root = base.join("gone");
+        let gone = corpus("gone", gone_root.to_str().expect("utf8"), &["**/*.md"]);
+        assert!(
+            state
+                .watch_registry()
+                .replace_source(
+                    ConfigSource::RepoLayer(gone_config.clone()),
+                    vec![gone],
+                    std::sync::Arc::new(cfg.clone()),
+                    watch_roots_for,
+                )
+                .is_err(),
+            "at-capacity source enters the bounded retry queue"
+        );
+        assert!(
+            state
+                .watch_registry()
+                .repo_layer_sources()
+                .contains(&gone_config)
+        );
+        reload_repo_layer(&state, &gone_config, &tracker, &mut memo);
+        let sources = state.watch_registry().repo_layer_sources();
+        assert!(
+            !sources.contains(&gone_config),
+            "confirmed-deleted config leaves retry queue"
+        );
+        reload_repo_layer(&state, &gone_config, &tracker, &mut memo);
+        assert_eq!(
+            state.watch_registry().repo_layer_sources().len(),
+            sources.len(),
+            "deleted source cannot grow retry queue"
+        );
+        std::fs::write(&config_path, valid).expect("restore config");
+        let retired = state
+            .watch_registry()
+            .replace_source(
+                ConfigSource::RepoLayer(base.join("other-0.toml")),
+                vec![],
+                std::sync::Arc::new(cfg),
+                watch_roots_for,
+            )
+            .expect("open one slot");
+        assert_eq!(retired.len(), 1);
+        drop(retired);
+        reconcile_ticks(&state, &mut pump, &tracker, &mut memo, 1);
+        tracker.close();
+        tracker.wait().await;
+        for _ in 0..4 {
+            let tracker = TaskTracker::new();
+            reconcile_ticks(&state, &mut pump, &tracker, &mut memo, 1);
+            tracker.close();
+            tracker.wait().await;
+        }
+        assert!(
+            registered(&state, "retry-only"),
+            "periodic reload alone admits retry-only source"
+        );
+        let selected = corpus("retry-only", docs.to_str().expect("utf8"), &["**/*.md"]);
+        assert!(
+            pr_786_followup_index_contains(&state, &selected, "pr786retryonlyrecovered", &note)
+                .await,
+            "periodic catch-up indexes existing note"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pr_786_followup_missing_alias_yields_live_events_to_outer_root() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().canonicalize().expect("canonical tempdir");
+        let repo = base.join("repo");
+        let docs = repo.join("docs");
+        let nested = docs.join("nested");
+        std::fs::create_dir_all(&nested).expect("create nested");
+        std::fs::create_dir(repo.join(".git")).expect("git boundary");
+        std::fs::create_dir(repo.join(".hallouminate")).expect("config dir");
+        let alias = repo.join("alias");
+        symlink(&nested, &alias).expect("create alias");
+        let config_path = repo.join(".hallouminate/config.toml");
+        std::fs::write(
+            &config_path,
+            "[[corpus]]\nname = \"outer\"\npaths = [\"docs\"]\nglobs = [\"**/*.md\"]\n[[corpus]]\nname = \"inner\"\npaths = [\"alias\"]\nglobs = [\"**/*.txt\"]\n",
+        )
+        .expect("config");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = base.join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg.clone(), None).await.expect("open");
+        let (effective, _) =
+            hallouminate_config::resolve_for_cwd(&cfg, &repo, None).expect("resolve repo");
+        register_runtime_corpora(&state, Some(&config_path), &effective.corpora, &effective)
+            .expect("register both roots");
+        let mut pump = PumpState::test_default();
+        let tracker = TaskTracker::new();
+        let mut memo = ReloadFailureMemo::new();
+        reconcile_ticks(&state, &mut pump, &tracker, &mut memo, 1);
+        tracker.close();
+        tracker.wait().await;
+        let tracker = TaskTracker::new();
+        assert!(registered(&state, "inner"));
+        std::fs::remove_file(&alias).expect("remove only alias");
+        reconcile_ticks(&state, &mut pump, &tracker, &mut memo, 1);
+        tracker.close();
+        tracker.wait().await;
+        let tracker = TaskTracker::new();
+        assert!(
+            registered(&state, "inner"),
+            "logical alias registration survives"
+        );
+        let outer = corpus("outer", docs.to_str().expect("utf8"), &["**/*.md"]);
+        let note = nested.join("note.md");
+        std::fs::write(&note, "# Note\n\npr786followupouter\n").expect("write note");
+        let mut failures = disabled_coalescer();
+        let mut churn = disabled_churn();
+        process_change_batch(
+            &state,
+            &pump.roots,
+            vec![note.clone()],
+            &mut failures,
+            &mut churn,
+        )
+        .await;
+        assert!(
+            pr_786_followup_index_contains(&state, &outer, "pr786followupouter", &note).await,
+            "missing alias must not steal the outer root's live event"
+        );
+        symlink(&nested, &alias).expect("recreate alias");
+        reconcile_ticks(&state, &mut pump, &tracker, &mut memo, 1);
+        tracker.close();
+        tracker.wait().await;
+        let tracker = TaskTracker::new();
+        let second = nested.join("second.md");
+        std::fs::write(&second, "# Second\n\npr786followuprejected\n").expect("write second");
+        process_change_batch(
+            &state,
+            &pump.roots,
+            vec![second.clone()],
+            &mut failures,
+            &mut churn,
+        )
+        .await;
+        assert!(
+            !pr_786_followup_index_contains(&state, &outer, "pr786followuprejected", &second).await,
+            "live nested alias must reject Markdown without outer fallback"
+        );
+        let inner = corpus("inner", alias.to_str().expect("utf8"), &["**/*.txt"]);
+        let text = nested.join("owned.txt");
+        std::fs::write(&text, "# Owned\n\npr786followupinner\n").expect("write text");
+        process_change_batch(
+            &state,
+            &pump.roots,
+            vec![text.clone()],
+            &mut failures,
+            &mut churn,
+        )
+        .await;
+        assert!(
+            pr_786_followup_index_contains(&state, &inner, "pr786followupinner", &text).await,
+            "live nested alias must own accepted text events"
+        );
+        tracker.close();
+        tracker.wait().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pr_786_missing_exact_file_alias_yields_event_to_outer_root() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().canonicalize().expect("canonical tempdir");
+        let repo = base.join("repo");
+        let docs = repo.join("docs");
+        std::fs::create_dir_all(&docs).expect("docs");
+        std::fs::create_dir(repo.join(".git")).expect("git");
+        std::fs::create_dir(repo.join(".hallouminate")).expect("config dir");
+        let note = docs.join("note.md");
+        std::fs::write(&note, "# Note\n").expect("note");
+        let alias = repo.join("alias.md");
+        symlink(&note, &alias).expect("alias");
+        let config_path = repo.join(".hallouminate/config.toml");
+        std::fs::write(
+            &config_path,
+            "[[corpus]]\nname = \"outer\"\npaths = [\"docs\"]\nglobs = [\"**/*.md\"]\n[[corpus]]\nname = \"inner\"\npaths = [\"alias.md\"]\nglobs = [\"**/*.txt\"]\n",
+        )
+        .expect("config");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = base.join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg.clone(), None).await.expect("open");
+        let (effective, _) =
+            hallouminate_config::resolve_for_cwd(&cfg, &repo, None).expect("resolve repo");
+        register_runtime_corpora(&state, Some(&config_path), &effective.corpora, &effective)
+            .expect("register roots");
+        let mut pump = PumpState::test_default();
+        let mut memo = ReloadFailureMemo::new();
+        let tracker = TaskTracker::new();
+        reconcile_ticks(&state, &mut pump, &tracker, &mut memo, 1);
+        tracker.close();
+        tracker.wait().await;
+        assert!(registered(&state, "inner"));
+
+        std::fs::remove_file(&alias).expect("remove alias only");
+        let tracker = TaskTracker::new();
+        reconcile_ticks(&state, &mut pump, &tracker, &mut memo, 1);
+        tracker.close();
+        tracker.wait().await;
+        assert!(
+            registered(&state, "inner"),
+            "missing alias remains registered"
+        );
+        std::fs::write(&note, "# Note\n\npr786exactfileouter\n").expect("edit note");
+        let outer = corpus("outer", docs.to_str().expect("utf8"), &["**/*.md"]);
+        let mut failures = disabled_coalescer();
+        let mut churn = disabled_churn();
+        process_change_batch(
+            &state,
+            &pump.roots,
+            vec![note.clone()],
+            &mut failures,
+            &mut churn,
+        )
+        .await;
+        assert!(
+            pr_786_followup_index_contains(&state, &outer, "pr786exactfileouter", &note).await,
+            "missing exact-file alias must yield the event to outer corpus"
+        );
+
+        symlink(&note, &alias).expect("restore alias");
+        let tracker = TaskTracker::new();
+        reconcile_ticks(&state, &mut pump, &tracker, &mut memo, 1);
+        tracker.close();
+        tracker.wait().await;
+        std::fs::write(&note, "# Note\n\npr786exactfilereject\n").expect("edit note again");
+        process_change_batch(
+            &state,
+            &pump.roots,
+            vec![note.clone()],
+            &mut failures,
+            &mut churn,
+        )
+        .await;
+        assert!(
+            !pr_786_followup_index_contains(&state, &outer, "pr786exactfilereject", &note).await,
+            "live exact-file owner rejects Markdown without outer fallback"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pr_786_missing_alias_retains_saved_root_until_target_disappears() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().canonicalize().expect("canonical tempdir");
+        let repo = base.join("repo");
+        let target = base.join("target");
+        let live = repo.join("live");
+        std::fs::create_dir_all(&target).expect("target");
+        std::fs::create_dir_all(&live).expect("live");
+        std::fs::create_dir(repo.join(".git")).expect("git boundary");
+        std::fs::create_dir(repo.join(".hallouminate")).expect("config dir");
+        let alias = repo.join("alias");
+        symlink(&target, &alias).expect("alias target");
+        let config_path = repo.join(".hallouminate/config.toml");
+        std::fs::write(
+            &config_path,
+            "[[corpus]]\nname = \"alias\"\npaths = [\"alias\"]\nglobs = [\"**/*.md\"]\n[[corpus]]\nname = \"live\"\npaths = [\"live\"]\nglobs = [\"**/*.md\"]\n",
+        )
+        .expect("config");
+        let note = target.join("retired.md");
+        let live_note = live.join("retained.md");
+        std::fs::write(&note, "# Retired\n\npr786aliasthenphysical\n").expect("target note");
+        std::fs::write(&live_note, "# Retained\n\npr786unrelatedlive\n").expect("live note");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.security.allow_repo_paths_outside_root = vec![target.display().to_string()];
+        cfg.daemon.maintenance_interval_secs = 0;
+        cfg.storage.ground_dir = base.join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg.clone(), None).await.expect("open");
+        let (effective, _) =
+            hallouminate_config::resolve_for_cwd(&cfg, &repo, None).expect("resolve repo");
+        register_runtime_corpora(&state, Some(&config_path), &effective.corpora, &effective)
+            .expect("register roots");
+        let alias_key = state
+            .watch_registry()
+            .snapshot_roots()
+            .into_iter()
+            .find(|(id, _)| id.corpus_key.name == "alias")
+            .expect("alias registration")
+            .0
+            .corpus_key;
+        let live_key = state
+            .watch_registry()
+            .snapshot_roots()
+            .into_iter()
+            .find(|(id, _)| id.corpus_key.name == "live")
+            .expect("live registration")
+            .0
+            .corpus_key;
+        assert_eq!(alias_key.canonical_root, target);
+        let mut pump = PumpState::test_default();
+        let tracker = TaskTracker::new();
+        let mut memo = ReloadFailureMemo::new();
+        reconcile_ticks(&state, &mut pump, &tracker, &mut memo, 1);
+        tracker.close();
+        tracker.wait().await;
+        let mut failures = disabled_coalescer();
+        let mut churn = disabled_churn();
+        process_change_batch(
+            &state,
+            &pump.roots,
+            vec![note.clone(), live_note.clone()],
+            &mut failures,
+            &mut churn,
+        )
+        .await;
+        let store = state
+            .resources_for(&effective)
+            .await
+            .expect("resources")
+            .store
+            .clone();
+        assert_eq!(
+            store
+                .list_files(&alias_key)
+                .await
+                .expect("alias files")
+                .len(),
+            1
+        );
+        assert_eq!(
+            store.list_files(&live_key).await.expect("live files").len(),
+            1
+        );
+        assert!(
+            pr_786_followup_index_contains(
+                &state,
+                &effective.corpora[0],
+                "pr786aliasthenphysical",
+                &note
+            )
+            .await,
+            "target content must have real Lance chunk rows"
+        );
+        assert!(
+            pr_786_followup_index_contains(
+                &state,
+                &effective.corpora[1],
+                "pr786unrelatedlive",
+                &live_note
+            )
+            .await,
+            "live content must have real Lance chunk rows"
+        );
+
+        std::fs::remove_file(&config_path).expect("remove config");
+        std::fs::remove_file(&alias).expect("remove alias");
+        for _ in 0..MISSING_ROOT_RETIRE_TICKS {
+            let tracker = TaskTracker::new();
+            reconcile_ticks(&state, &mut pump, &tracker, &mut memo, 1);
+            tracker.close();
+            tracker.wait().await;
+        }
+        assert_eq!(
+            store
+                .list_files(&alias_key)
+                .await
+                .expect("live target files")
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .list_files(&live_key)
+                .await
+                .expect("unrelated files")
+                .len(),
+            1
+        );
+        assert!(
+            !pump.roots.iter().any(|root| root.corpus.name == "alias"),
+            "missing alias must not own event routing"
+        );
+
+        std::fs::remove_dir_all(&target).expect("remove saved target");
+        for _ in 0..MISSING_ROOT_RETIRE_TICKS {
+            let tracker = TaskTracker::new();
+            reconcile_ticks(&state, &mut pump, &tracker, &mut memo, 1);
+            tracker.close();
+            tracker.wait().await;
+        }
+        assert!(
+            store
+                .list_files(&alias_key)
+                .await
+                .expect("retired file map")
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .corpus_chunk_stats(&alias_key)
+                .await
+                .expect("retired chunks")
+                .total_chunks,
+            0,
+            "retirement deletes saved-root chunk rows"
+        );
+        assert_eq!(
+            store
+                .list_files(&live_key)
+                .await
+                .expect("live file map")
+                .len(),
+            1
+        );
+        assert!(
+            store
+                .corpus_chunk_stats(&live_key)
+                .await
+                .expect("live chunks")
+                .total_chunks
+                > 0,
+            "unrelated live chunk rows remain"
+        );
+    }
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pr_786_relocated_repo_replaces_stale_alias_owner() {
+        use crate::ipc::{
+            DaemonRequest, DaemonRequestPayload, DaemonResponse, ErrorKind, GroundResult,
+            IndexRequest,
+        };
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().canonicalize().expect("canonical tempdir");
+        let target = base.join("target");
+        let old_repo = base.join("old-repo");
+        let control_repo = base.join("control-repo");
+        let new_repo = base.join("new-repo");
+        std::fs::create_dir(&target).expect("external target");
+        let note = target.join("note.md");
+        std::fs::write(&note, "# Note\n\npr786relocatedoriginal\n").expect("target note");
+        for repo in [&old_repo, &control_repo] {
+            std::fs::create_dir(repo).expect("repo");
+            std::fs::create_dir(repo.join(".git")).expect("git boundary");
+            std::fs::create_dir(repo.join(".hallouminate")).expect("config dir");
+            symlink(&target, repo.join("alias")).expect("alias");
+            std::fs::write(
+                repo.join(".hallouminate/config.toml"),
+                "[[corpus]]\nname = \"alias\"\npaths = [\"alias\"]\nglobs = [\"**/*.md\"]\n",
+            )
+            .expect("config");
+        }
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.search.cold_wait_ms = 0;
+        cfg.daemon.maintenance_interval_secs = 0;
+        cfg.security.allow_repo_paths_outside_root = vec![target.display().to_string()];
+        cfg.storage.ground_dir = base.join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg, None).await.expect("open");
+        let index = crate::dispatch::dispatch(
+            &state,
+            DaemonRequest {
+                cwd: old_repo.clone(),
+                payload: DaemonRequestPayload::Index(IndexRequest {
+                    corpus: Some("alias".into()),
+                    paths_from: None,
+                    strict: false,
+                    background: false,
+                }),
+            },
+        )
+        .await;
+        let DaemonResponse::Ok { .. } = index else {
+            panic!("initial real index must succeed: {index:?}");
+        };
+        let request = |cwd: PathBuf, query: &'static str| DaemonRequest {
+            cwd,
+            payload: DaemonRequestPayload::Ground(
+                serde_json::from_value(serde_json::json!({
+                    "query": query,
+                    "corpus": "alias",
+                    "match": "phrase",
+                }))
+                .expect("ground request"),
+            ),
+        };
+        let original =
+            crate::dispatch::dispatch(&state, request(old_repo.clone(), "pr786relocatedoriginal"))
+                .await;
+        let DaemonResponse::Ok { result } = original else {
+            panic!("old repo must find indexed note: {original:?}");
+        };
+        let result: GroundResult = serde_json::from_value(result).expect("ground result");
+        assert_eq!(result.response.docs.len(), 1, "indexed note only");
+        assert!(
+            result
+                .response
+                .docs
+                .contains_key(&note.to_string_lossy().into_owned()),
+            "old repo Ground must return the external target through Lance: {:?}",
+            result.response.docs
+        );
+        let conflict = crate::dispatch::dispatch(
+            &state,
+            request(control_repo.clone(), "pr786relocatedoriginal"),
+        )
+        .await;
+        let DaemonResponse::Err { kind, message } = conflict else {
+            panic!("two live source bindings must conflict: {conflict:?}");
+        };
+        assert_eq!(kind, ErrorKind::InvalidParams);
+        assert!(
+            message.contains("incompatible watcher registration"),
+            "live source must fail for the binding conflict: {message}"
+        );
+
+        std::fs::rename(&old_repo, &new_repo).expect("move entire repo");
+        let old_config = old_repo.join(".hallouminate/config.toml");
+        let new_config = new_repo.join(".hallouminate/config.toml");
+        assert!(!old_config.exists(), "old config moved with repo");
+        assert!(new_config.exists(), "new config moved with repo");
+        assert!(target.exists(), "external target remains live");
+        let mut pump = PumpState::test_default();
+        let tracker = TaskTracker::new();
+        let mut memo = ReloadFailureMemo::new();
+        reconcile_ticks(
+            &state,
+            &mut pump,
+            &tracker,
+            &mut memo,
+            MISSING_ROOT_RETIRE_TICKS,
+        );
+        assert!(
+            state.watch_registry().snapshot_roots().is_empty(),
+            "departed checkout must leave active ownership before new admission"
+        );
+        assert!(
+            pump.roots.is_empty(),
+            "departed checkout must leave native desired roots before new admission"
+        );
+
+        let relocated =
+            crate::dispatch::dispatch(&state, request(new_repo.clone(), "pr786relocatedoriginal"))
+                .await;
+        let DaemonResponse::Ok { result } = relocated else {
+            panic!("relocated repo Ground must reuse live indexed note: {relocated:?}");
+        };
+        let result: GroundResult = serde_json::from_value(result).expect("relocated ground");
+        assert_eq!(result.response.docs.len(), 1, "relocated indexed note only");
+        assert!(
+            result
+                .response
+                .docs
+                .contains_key(&note.to_string_lossy().into_owned()),
+            "relocated Ground must return the indexed external target: {:?}",
+            result.response.docs
+        );
+        let owners = state.watch_registry().snapshot_roots();
+        assert_eq!(owners.len(), 1, "relocated source alone owns the target");
+        assert_eq!(owners[0].0.source, ConfigSource::RepoLayer(new_config));
+        assert_eq!(owners[0].0.corpus_key.canonical_root, target);
+
+        reconcile_ticks(&state, &mut pump, &tracker, &mut memo, 1);
+        std::fs::write(&note, "# Note\n\npr786relocatededited\n").expect("edit target note");
+        let mut failures = disabled_coalescer();
+        let mut churn = disabled_churn();
+        process_change_batch(
+            &state,
+            &pump.roots,
+            vec![note.clone()],
+            &mut failures,
+            &mut churn,
+        )
+        .await;
+        let edited =
+            crate::dispatch::dispatch(&state, request(new_repo, "pr786relocatededited")).await;
+        let DaemonResponse::Ok { result } = edited else {
+            panic!("relocated event content must be searchable: {edited:?}");
+        };
+        let result: GroundResult = serde_json::from_value(result).expect("edited ground");
+        assert!(
+            result
+                .response
+                .docs
+                .contains_key(&note.to_string_lossy().into_owned()),
+            "relocated owner must route the target edit into Lance: {:?}",
+            result.response.docs
+        );
+        tracker.close();
+        tracker.wait().await;
+    }
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pr_786_restored_partial_binding_releases_detached_slot_on_root_refresh() {
+        use crate::ipc::{
+            DaemonRequest, DaemonRequestPayload, DaemonResponse, GroundResult, IndexRequest,
+        };
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().canonicalize().expect("canonical tempdir");
+        let target = base.join("target");
+        let repo = base.join("repo");
+        let moved = base.join("moved");
+        std::fs::create_dir(&target).expect("external target");
+        std::fs::write(target.join("note.md"), "# Note\n\npr786savedslotmarker\n")
+            .expect("target note");
+        std::fs::create_dir(&repo).expect("repo");
+        std::fs::create_dir(repo.join(".git")).expect("git boundary");
+        std::fs::create_dir(repo.join(".hallouminate")).expect("config directory");
+        std::fs::create_dir(repo.join("generated")).expect("generated root");
+        symlink(&target, repo.join("alias")).expect("external alias");
+        let config = "[[corpus]]\nname = \"alias\"\npaths = [\"alias\", \"generated\"]\nglobs = [\"**/*.md\"]\n";
+        std::fs::write(repo.join(".hallouminate/config.toml"), config).expect("config");
+
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.search.cold_wait_ms = 0;
+        cfg.daemon.maintenance_interval_secs = 0;
+        cfg.security.allow_repo_paths_outside_root = vec![target.display().to_string()];
+        cfg.storage.ground_dir = base.join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg.clone(), None).await.expect("open");
+        let request = |payload| DaemonRequest {
+            cwd: repo.clone(),
+            payload,
+        };
+        let index = crate::dispatch::dispatch(
+            &state,
+            request(DaemonRequestPayload::Index(IndexRequest {
+                corpus: Some("alias".into()),
+                paths_from: None,
+                strict: false,
+                background: false,
+            })),
+        )
+        .await;
+        let DaemonResponse::Ok { .. } = index else {
+            panic!("real index must succeed: {index:?}");
+        };
+        let ground = || {
+            request(DaemonRequestPayload::Ground(
+                serde_json::from_value(serde_json::json!({
+                    "query": "pr786savedslotmarker",
+                    "corpus": "alias",
+                    "match": "phrase",
+                }))
+                .expect("ground request"),
+            ))
+        };
+        let initial = crate::dispatch::dispatch(&state, ground()).await;
+        let DaemonResponse::Ok { result } = initial else {
+            panic!("initial Ground must succeed: {initial:?}");
+        };
+        let result: GroundResult = serde_json::from_value(result).expect("ground result");
+        assert!(
+            result
+                .response
+                .docs
+                .contains_key(&target.join("note.md").to_string_lossy().into_owned())
+        );
+
+        let mut pump = PumpState::test_default();
+        let tracker = TaskTracker::new();
+        let mut memo = ReloadFailureMemo::new();
+        std::fs::rename(&repo, &moved).expect("move checkout");
+        reconcile_ticks(
+            &state,
+            &mut pump,
+            &tracker,
+            &mut memo,
+            MISSING_ROOT_RETIRE_TICKS,
+        );
+        assert!(state.watch_registry().snapshot_roots().is_empty());
+        assert_eq!(state.watch_registry().detached_probes().len(), 1);
+        assert!(target.exists(), "saved target stays live");
+
+        let pressure_cfg = std::sync::Arc::new(cfg.clone());
+        for index in 0..254 {
+            let name = format!("pressure-{index}");
+            let source = registry::ConfigSource::RepoLayer(
+                base.join(format!("{name}/.hallouminate/config.toml")),
+            );
+            let corpus = CorpusConfig {
+                name,
+                paths: vec![],
+                globs: vec![],
+                exclude: vec![],
+                global: false,
+            };
+            assert_eq!(
+                state
+                    .watch_registry()
+                    .register(source, corpus, pressure_cfg.clone(), vec![]),
+                registry::RegisterOutcome::New
+            );
+        }
+        std::fs::create_dir(&repo).expect("restore checkout path");
+        std::fs::create_dir(repo.join(".git")).expect("restore git boundary");
+        std::fs::create_dir(repo.join(".hallouminate")).expect("restore config directory");
+        symlink(&target, repo.join("alias")).expect("restore alias");
+        std::fs::write(repo.join(".hallouminate/config.toml"), config).expect("restore config");
+        assert!(
+            !repo.join("generated").exists(),
+            "generated root remains absent"
+        );
+        let partial = crate::dispatch::dispatch(&state, ground()).await;
+        let DaemonResponse::Ok { result } = partial else {
+            panic!("Ground must admit a partial binding with one spare slot: {partial:?}");
+        };
+        let result: GroundResult = serde_json::from_value(result).expect("partial Ground result");
+        assert!(
+            result
+                .response
+                .docs
+                .contains_key(&target.join("note.md").to_string_lossy().into_owned())
+        );
+        assert_eq!(state.watch_registry().detached_probes().len(), 1);
+        let source = registry::ConfigSource::RepoLayer(base.join("new/.hallouminate/config.toml"));
+        let candidate_root = base.join("candidate-root");
+        std::fs::create_dir(&candidate_root).expect("candidate root");
+        let candidate = CorpusConfig {
+            name: "candidate".into(),
+            paths: vec![candidate_root.to_string_lossy().into_owned()],
+            globs: vec![],
+            exclude: vec![],
+            global: false,
+        };
+        assert_eq!(
+            state.watch_registry().register(
+                source.clone(),
+                candidate.clone(),
+                std::sync::Arc::new(cfg.clone()),
+                watch_roots_for(&candidate)
+            ),
+            registry::RegisterOutcome::LimitReached,
+            "partial registration and saved-slot debt must fill the cap"
+        );
+
+        std::fs::create_dir(repo.join("generated")).expect("restore generated root");
+        pump.reconcile(&state, &tracker, WatchRetry::RegistryChange);
+        assert_eq!(
+            state.watch_registry().register(
+                source.clone(),
+                candidate.clone(),
+                std::sync::Arc::new(cfg.clone()),
+                watch_roots_for(&candidate)
+            ),
+            registry::RegisterOutcome::New,
+            "registry-change root refresh must discharge the saved-slot debt"
+        );
+        assert!(
+            state
+                .watch_registry()
+                .snapshot_roots()
+                .iter()
+                .any(|(id, root)| {
+                    id.source == source && root.canonical_watched == candidate_root
+                }),
+            "new candidate must own a real watched directory"
+        );
+        let unchanged = crate::dispatch::dispatch(&state, ground()).await;
+        let DaemonResponse::Ok { result } = unchanged else {
+            panic!("unchanged Ground must succeed: {unchanged:?}");
+        };
+        let result: GroundResult = serde_json::from_value(result).expect("unchanged Ground result");
+        assert!(
+            result
+                .response
+                .docs
+                .contains_key(&target.join("note.md").to_string_lossy().into_owned())
+        );
+        let next = registry::ConfigSource::RepoLayer(base.join("next/.hallouminate/config.toml"));
+        let next_corpus = CorpusConfig {
+            name: "next".into(),
+            paths: vec![],
+            globs: vec![],
+            exclude: vec![],
+            global: false,
+        };
+        assert_eq!(
+            state
+                .watch_registry()
+                .register(next, next_corpus, std::sync::Arc::new(cfg), vec![]),
+            registry::RegisterOutcome::LimitReached,
+            "the real cap still applies after debt is discharged"
+        );
+        tracker.close();
+        tracker.wait().await;
+    }
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pr_786_departed_checkout_keeps_rows_until_saved_target_disappears() {
+        use crate::ipc::{DaemonRequest, DaemonRequestPayload, DaemonResponse, IndexRequest};
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().canonicalize().expect("canonical tempdir");
+        let target = base.join("target");
+        let repo = base.join("repo");
+        std::fs::create_dir(&target).expect("target");
+        std::fs::create_dir(&repo).expect("repo");
+        std::fs::create_dir(repo.join(".git")).expect("git");
+        std::fs::create_dir(repo.join(".hallouminate")).expect("config dir");
+        symlink(&target, repo.join("alias")).expect("alias");
+        std::fs::write(
+            repo.join(".hallouminate/config.toml"),
+            "[[corpus]]\nname = \"alias\"\npaths = [\"alias\"]\nglobs = [\"**/*.md\"]\n",
+        )
+        .expect("config");
+        std::fs::write(target.join("note.md"), "# Note\n\npr786departedcheckout\n").expect("note");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.daemon.maintenance_interval_secs = 0;
+        cfg.security.allow_repo_paths_outside_root = vec![target.display().to_string()];
+        cfg.storage.ground_dir = base.join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg.clone(), None).await.expect("open");
+        let result = crate::dispatch::dispatch(
+            &state,
+            DaemonRequest {
+                cwd: repo.clone(),
+                payload: DaemonRequestPayload::Index(IndexRequest {
+                    corpus: Some("alias".into()),
+                    paths_from: None,
+                    strict: false,
+                    background: false,
+                }),
+            },
+        )
+        .await;
+        let DaemonResponse::Ok { .. } = result else {
+            panic!("index must succeed: {result:?}");
+        };
+        let (effective, _) =
+            hallouminate_config::resolve_for_cwd(&cfg, &repo, None).expect("resolve repo");
+        register_runtime_corpora(
+            &state,
+            Some(&repo.join(".hallouminate/config.toml")),
+            &effective.corpora,
+            &effective,
+        )
+        .expect("register root");
+        let key = state.watch_registry().snapshot_roots()[0]
+            .0
+            .corpus_key
+            .clone();
+        let store = state
+            .resources_for(&effective)
+            .await
+            .expect("resources")
+            .store
+            .clone();
+        assert_eq!(store.list_files(&key).await.expect("files").len(), 1);
+
+        std::fs::remove_dir_all(&repo).expect("remove checkout");
+        let mut pump = PumpState::test_default();
+        let mut memo = ReloadFailureMemo::new();
+        for _ in 0..MISSING_ROOT_RETIRE_TICKS {
+            let tracker = TaskTracker::new();
+            reconcile_ticks(&state, &mut pump, &tracker, &mut memo, 1);
+            tracker.close();
+            tracker.wait().await;
+        }
+        assert!(state.watch_registry().snapshot_roots().is_empty());
+        assert_eq!(state.watch_registry().detached_probes().len(), 1);
+        assert_eq!(
+            store.list_files(&key).await.expect("retained files").len(),
+            1
+        );
+        assert!(
+            store
+                .corpus_chunk_stats(&key)
+                .await
+                .expect("retained chunks")
+                .total_chunks
+                > 0
+        );
+
+        std::fs::remove_dir_all(&target).expect("remove saved target");
+        for _ in 0..MISSING_ROOT_RETIRE_TICKS {
+            let tracker = TaskTracker::new();
+            reconcile_ticks(&state, &mut pump, &tracker, &mut memo, 1);
+            tracker.close();
+            tracker.wait().await;
+        }
+        assert!(state.watch_registry().detached_probes().is_empty());
+        assert!(
+            store
+                .list_files(&key)
+                .await
+                .expect("cleaned files")
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .corpus_chunk_stats(&key)
+                .await
+                .expect("cleaned chunks")
+                .total_chunks,
+            0
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pr_786_returned_detached_target_rearms_cleanup_after_queued_job() {
+        use crate::ipc::{DaemonRequest, DaemonRequestPayload, DaemonResponse, IndexRequest};
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().canonicalize().expect("canonical tempdir");
+        let target = base.join("target");
+        let sibling = base.join("sibling");
+        let live = base.join("live");
+        let repo = base.join("repo");
+        for dir in [&target, &sibling, &live, &repo] {
+            std::fs::create_dir(dir).expect("fixture root");
+        }
+        std::fs::create_dir(repo.join(".git")).expect("git");
+        std::fs::create_dir(repo.join(".hallouminate")).expect("config dir");
+        symlink(&target, repo.join("alias")).expect("alias");
+        symlink(&sibling, repo.join("sibling")).expect("sibling alias");
+        symlink(&live, repo.join("live")).expect("live alias");
+        std::fs::write(
+            repo.join(".hallouminate/config.toml"),
+            "[[corpus]]\nname = \"alias\"\npaths = [\"alias\", \"sibling\"]\nglobs = [\"**/*.md\"]\n[[corpus]]\nname = \"live\"\npaths = [\"live\"]\nglobs = [\"**/*.md\"]\n",
+        )
+        .expect("config");
+        std::fs::write(target.join("note.md"), "# Note\n\npr786returnqueue\n").expect("note");
+        std::fs::write(sibling.join("sibling.md"), "# Sibling\n\npr786sibling\n")
+            .expect("sibling note");
+        std::fs::write(live.join("live.md"), "# Live\n\npr786live\n").expect("live note");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.daemon.maintenance_interval_secs = 0;
+        cfg.security.allow_repo_paths_outside_root = vec![
+            target.display().to_string(),
+            sibling.display().to_string(),
+            live.display().to_string(),
+        ];
+        cfg.storage.ground_dir = base.join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg.clone(), None).await.expect("open");
+        let result = crate::dispatch::dispatch(
+            &state,
+            DaemonRequest {
+                cwd: repo.clone(),
+                payload: DaemonRequestPayload::Index(IndexRequest {
+                    corpus: Some("alias".into()),
+                    paths_from: None,
+                    strict: false,
+                    background: false,
+                }),
+            },
+        )
+        .await;
+        let DaemonResponse::Ok { .. } = result else {
+            panic!("index must succeed: {result:?}");
+        };
+        let live_result = crate::dispatch::dispatch(
+            &state,
+            DaemonRequest {
+                cwd: repo.clone(),
+                payload: DaemonRequestPayload::Index(IndexRequest {
+                    corpus: Some("live".into()),
+                    paths_from: None,
+                    strict: false,
+                    background: false,
+                }),
+            },
+        )
+        .await;
+        let DaemonResponse::Ok { .. } = live_result else {
+            panic!("live index must succeed: {live_result:?}");
+        };
+        let (effective, _) =
+            hallouminate_config::resolve_for_cwd(&cfg, &repo, None).expect("resolve repo");
+        register_runtime_corpora(
+            &state,
+            Some(&repo.join(".hallouminate/config.toml")),
+            &effective.corpora,
+            &effective,
+        )
+        .expect("register root");
+        let key = corpus("alias", target.to_str().expect("utf8"), &["**/*.md"])
+            .corpus_keys()
+            .remove(0);
+        let sibling_key = corpus("alias", sibling.to_str().expect("utf8"), &["**/*.md"])
+            .corpus_keys()
+            .remove(0);
+        let live_key = corpus("live", live.to_str().expect("utf8"), &["**/*.md"])
+            .corpus_keys()
+            .remove(0);
+        let store = state
+            .resources_for(&effective)
+            .await
+            .expect("resources")
+            .store
+            .clone();
+        assert_eq!(store.list_files(&key).await.expect("initial rows").len(), 1);
+        assert_eq!(
+            store
+                .list_files(&sibling_key)
+                .await
+                .expect("initial sibling rows")
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .list_files(&live_key)
+                .await
+                .expect("initial live rows")
+                .len(),
+            1
+        );
+        assert!(
+            store
+                .corpus_chunk_stats(&key)
+                .await
+                .expect("initial chunks")
+                .total_chunks
+                > 0
+        );
+
+        std::fs::remove_dir_all(&repo).expect("remove checkout");
+        let tracker = TaskTracker::new();
+        for _ in 0..MISSING_ROOT_RETIRE_TICKS {
+            retire_missing_registrations(&state, &tracker);
+        }
+        std::fs::remove_dir_all(&target).expect("remove target");
+        std::fs::remove_dir_all(&sibling).expect("remove sibling");
+        for _ in 0..MISSING_ROOT_RETIRE_TICKS {
+            retire_missing_registrations(&state, &tracker);
+        }
+        std::fs::create_dir(&target).expect("target returns");
+        let jobs = state.watch_registry().take_pending_cleanups();
+        assert_eq!(jobs.len(), 1, "expired detached cleanup must be queued");
+        for job in jobs {
+            spawn_retired_cleanup(&state, &tracker, job);
+        }
+        tracker.close();
+        tracker.wait().await;
+        assert!(
+            store
+                .list_files(&sibling_key)
+                .await
+                .expect("cleaned sibling rows")
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .corpus_chunk_stats(&sibling_key)
+                .await
+                .expect("cleaned sibling chunks")
+                .total_chunks,
+            0
+        );
+        assert_eq!(
+            store
+                .list_files(&live_key)
+                .await
+                .expect("retained live rows")
+                .len(),
+            1
+        );
+        assert!(
+            store
+                .corpus_chunk_stats(&live_key)
+                .await
+                .expect("retained live chunks")
+                .total_chunks
+                > 0
+        );
+        assert_eq!(
+            store.list_files(&key).await.expect("returned rows").len(),
+            1
+        );
+        assert!(
+            store
+                .corpus_chunk_stats(&key)
+                .await
+                .expect("returned chunks")
+                .total_chunks
+                > 0
+        );
+        std::fs::create_dir(&sibling).expect("fresh sibling");
+        std::fs::write(sibling.join("fresh.md"), "# Fresh\n\npr786freshsibling\n")
+            .expect("fresh note");
+        let fresh_repo = base.join("fresh-repo");
+        std::fs::create_dir(&fresh_repo).expect("fresh repo");
+        std::fs::create_dir(fresh_repo.join(".git")).expect("fresh git");
+        std::fs::create_dir(fresh_repo.join(".hallouminate")).expect("fresh config dir");
+        symlink(&sibling, fresh_repo.join("sibling")).expect("fresh alias");
+        std::fs::write(
+            fresh_repo.join(".hallouminate/config.toml"),
+            "[[corpus]]\nname = \"fresh\"\npaths = [\"sibling\"]\nglobs = [\"**/*.md\"]\n",
+        )
+        .expect("fresh config");
+        let fresh_result = crate::dispatch::dispatch(
+            &state,
+            DaemonRequest {
+                cwd: fresh_repo.clone(),
+                payload: DaemonRequestPayload::Index(IndexRequest {
+                    corpus: Some("fresh".into()),
+                    paths_from: None,
+                    strict: false,
+                    background: false,
+                }),
+            },
+        )
+        .await;
+        let DaemonResponse::Ok { .. } = fresh_result else {
+            panic!("fresh index must succeed: {fresh_result:?}");
+        };
+        let fresh_key = corpus("fresh", sibling.to_str().expect("utf8"), &["**/*.md"])
+            .corpus_keys()
+            .remove(0);
+        assert_eq!(
+            store
+                .list_files(&fresh_key)
+                .await
+                .expect("fresh rows")
+                .len(),
+            1
+        );
+        std::fs::remove_dir_all(&fresh_repo).expect("remove fresh checkout");
+        std::fs::remove_dir_all(&sibling).expect("remove fresh sibling");
+        std::fs::remove_dir(&target).expect("target disappears again");
+        let tracker = TaskTracker::new();
+        for _ in 0..MISSING_ROOT_RETIRE_TICKS {
+            retire_missing_registrations(&state, &tracker);
+        }
+        for job in state.watch_registry().take_pending_cleanups() {
+            spawn_retired_cleanup(&state, &tracker, job);
+        }
+        tracker.close();
+        tracker.wait().await;
+        assert!(
+            store
+                .list_files(&key)
+                .await
+                .expect("eventual files")
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .corpus_chunk_stats(&key)
+                .await
+                .expect("eventual chunks")
+                .total_chunks,
+            0
+        );
+        assert_eq!(
+            store
+                .list_files(&fresh_key)
+                .await
+                .expect("surviving fresh rows")
+                .len(),
+            1
+        );
+        assert!(
+            store
+                .corpus_chunk_stats(&fresh_key)
+                .await
+                .expect("surviving fresh chunks")
+                .total_chunks
+                > 0
+        );
+        assert_eq!(
+            store
+                .list_files(&live_key)
+                .await
+                .expect("surviving live rows")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn pr_786_config_removal_never_logs_missing_root_retirement() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (state, repo, _root) = repo_layer_fixture(tmp.path()).await;
+        let capture = LogCapture::default();
+        let guard = capture.install();
+        let retired = state
+            .watch_registry()
+            .replace_source(
+                registry::ConfigSource::RepoLayer(repo.join(".hallouminate/config.toml")),
+                vec![],
+                std::sync::Arc::new(state.baseline().clone()),
+                watch_roots_for,
+            )
+            .expect("remove config source");
+        assert_eq!(retired.len(), 1);
+        let tracker = TaskTracker::new();
+        for job in retired {
+            spawn_retired_cleanup(&state, &tracker, job);
+        }
+        tracker.close();
+        tracker.wait().await;
+        drop(guard);
+        assert!(
+            capture
+                .events(tracing::Level::INFO, RETIRED_MESSAGE)
+                .is_empty(),
+            "ConfigRemoval must not claim a missing-root retirement"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pr_786_deferred_missing_root_logs_once_when_admitted() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().canonicalize().expect("canonical tempdir");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.daemon.maintenance_interval_secs = 0;
+        cfg.storage.ground_dir = base.join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg.clone(), None).await.expect("open");
+        let source = registry::ConfigSource::RepoLayer(base.join("removed-config.toml"));
+        let mut occupied = Vec::new();
+        for number in 0..64 {
+            let root = base.join(format!("occupied-{number}"));
+            std::fs::create_dir(&root).expect("occupied root");
+            let selected = corpus(
+                &format!("occupied-{number}"),
+                root.to_str().expect("utf8"),
+                &["**/*.md"],
+            );
+            assert_eq!(
+                state.watch_registry().register(
+                    source.clone(),
+                    selected.clone(),
+                    std::sync::Arc::new(cfg.clone()),
+                    watch_roots_for(&selected),
+                ),
+                registry::RegisterOutcome::New,
+            );
+        }
+        occupied.extend(
+            state
+                .watch_registry()
+                .replace_source(
+                    source,
+                    vec![],
+                    std::sync::Arc::new(cfg.clone()),
+                    watch_roots_for,
+                )
+                .expect("occupy cleanup permits"),
+        );
+        assert_eq!(occupied.len(), 64);
+        assert!(
+            occupied.iter().all(|job| job._permit.is_some()),
+            "all cleanup permits are held"
+        );
+        let repo = base.join("repo");
+        let root = repo.join("wiki");
+        std::fs::create_dir_all(&root).expect("wiki");
+        std::fs::create_dir(repo.join(".git")).expect("git boundary");
+        std::fs::create_dir(repo.join(".hallouminate")).expect("config dir");
+        let config_path = repo.join(".hallouminate/config.toml");
+        std::fs::write(
+            &config_path,
+            "[[corpus]]\nname = \"deferred\"\npaths = [\"wiki\"]\nglobs = [\"**/*.md\"]\n",
+        )
+        .expect("config");
+        let selected = corpus("deferred", root.to_str().expect("utf8"), &["**/*.md"]);
+        assert_eq!(
+            state.watch_registry().register(
+                registry::ConfigSource::RepoLayer(config_path.clone()),
+                selected.clone(),
+                std::sync::Arc::new(cfg.clone()),
+                watch_roots_for(&corpus(
+                    "deferred",
+                    root.to_str().expect("utf8"),
+                    &["**/*.md"]
+                )),
+            ),
+            registry::RegisterOutcome::New,
+        );
+        let id = state
+            .watch_registry()
+            .snapshot_roots()
+            .iter()
+            .find(|(id, _)| id.corpus_key.name == "deferred")
+            .expect("deferred id")
+            .0
+            .clone();
+        let key = id.corpus_key.clone();
+        let resources = state.resources_for(&cfg).await.expect("resources");
+        seed_retired_root_rows(&resources.store, &key).await;
+        std::fs::remove_dir_all(&repo).expect("remove repo");
+        let capture = LogCapture::default();
+        let guard = capture.install();
+        let mut pump = PumpState::test_default();
+        let mut memo = ReloadFailureMemo::new();
+        let tracker = TaskTracker::new();
+        let observations = collect_root_observations(&state);
+        let observed = observations
+            .values()
+            .find(|observation| observation.probe.id.corpus_key.name == "deferred")
+            .expect("deferred observation");
+        match observed.presence {
+            registry::RootPresence::Absent => {}
+            registry::RootPresence::CheckoutAbsent | registry::RootPresence::Present => {
+                panic!("ordinary root must be absent")
+            }
+        }
+        for tick in 0..MISSING_ROOT_RETIRE_TICKS {
+            run_reconcile_tick(&state, &mut pump, &tracker, &mut memo);
+            assert!(
+                state.watch_registry().observation(&id).is_some(),
+                "permit cap defers actual retirement at tick {tick}"
+            );
+        }
+        assert!(
+            capture
+                .events(tracing::Level::INFO, RETIRED_MESSAGE)
+                .is_empty(),
+            "deferral is not actual retirement"
+        );
+        drop(occupied);
+        run_reconcile_tick(&state, &mut pump, &tracker, &mut memo);
+        std::os::unix::fs::symlink(&repo, &repo).expect("ELOOP ancestor");
+        assert_eq!(
+            std::fs::metadata(&root)
+                .expect_err("self-symlink must fail")
+                .raw_os_error(),
+            Some(libc::ELOOP),
+        );
+        tracker.close();
+        tracker.wait().await;
+        assert!(state.watch_registry().observation(&id).is_none());
+        assert_eq!(
+            resources
+                .store
+                .corpus_chunk_stats(&key)
+                .await
+                .expect("rows survive failed attempt")
+                .total_chunks,
+            1,
+        );
+        assert_eq!(
+            capture.events(tracing::Level::INFO, RETIRED_MESSAGE).len(),
+            1,
+            "failed cleanup must not repeat the retirement event"
+        );
+        std::fs::remove_file(&repo).expect("remove ELOOP ancestor");
+        let retry = TaskTracker::new();
+        run_reconcile_tick(&state, &mut pump, &retry, &mut memo);
+        retry.close();
+        retry.wait().await;
+        drop(guard);
+        assert_eq!(
+            resources
+                .store
+                .corpus_chunk_stats(&key)
+                .await
+                .expect("cleaned chunks")
+                .total_chunks,
+            0,
+        );
+        let notices = capture.events(tracing::Level::INFO, RETIRED_MESSAGE);
+        assert_eq!(notices.len(), 1, "actual deferred retirement logs once");
+        assert_eq!(
+            notices[0].get("corpus").map(String::as_str),
+            Some("deferred")
+        );
+        assert_eq!(notices[0].get("root").map(String::as_str), root.to_str());
+        assert_eq!(
+            notices[0].get("absent_ticks").map(String::as_str),
+            Some("3")
+        );
+    }
+
+    #[cfg(unix)]
+    enum Pr786OrdinaryTiming {
+        Admitted,
+        Parked,
+    }
+
+    #[cfg(unix)]
+    async fn pr_786_ordinary_successor_survives_old_cleanup(timing: Pr786OrdinaryTiming) {
+        use crate::ipc::{DaemonRequest, DaemonRequestPayload, DaemonResponse, IndexRequest};
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().canonicalize().expect("canonical tempdir");
+        let repo = base.join("repo");
+        let root = repo.join("wiki");
+        let note = root.join("note.md");
+        let config_path = repo.join(".hallouminate/config.toml");
+        let config = "[[corpus]]\nname = \"ordinary\"\npaths = [\"wiki\"]\nglobs = [\"**/*.md\"]\n";
+        let create_repo = |marker: &str| {
+            std::fs::create_dir_all(&root).expect("wiki");
+            std::fs::create_dir(repo.join(".git")).expect("git boundary");
+            std::fs::create_dir(repo.join(".hallouminate")).expect("config dir");
+            std::fs::write(&config_path, config).expect("config");
+            std::fs::write(&note, format!("# Note\n\n{marker}\n")).expect("note");
+        };
+        create_repo("pr786ordinaryold");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.daemon.maintenance_interval_secs = 0;
+        cfg.storage.ground_dir = base.join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg.clone(), None).await.expect("open");
+        let request = || DaemonRequest {
+            cwd: repo.clone(),
+            payload: DaemonRequestPayload::Index(IndexRequest {
+                corpus: Some("ordinary".into()),
+                paths_from: None,
+                strict: false,
+                background: false,
+            }),
+        };
+        let result = crate::dispatch::dispatch(&state, request()).await;
+        let DaemonResponse::Ok { .. } = result else {
+            panic!("old index must succeed: {result:?}");
+        };
+        let (effective, _) =
+            hallouminate_config::resolve_for_cwd(&cfg, &repo, None).expect("resolve old repo");
+        register_runtime_corpora(&state, Some(&config_path), &effective.corpora, &effective)
+            .expect("register old source");
+        let key = state.watch_registry().snapshot_roots()[0]
+            .0
+            .corpus_key
+            .clone();
+        let store = state
+            .resources_for(&effective)
+            .await
+            .expect("resources")
+            .store
+            .clone();
+        assert_eq!(store.list_files(&key).await.expect("old files").len(), 1);
+
+        let tracker = TaskTracker::new();
+        std::fs::remove_dir_all(&repo).expect("remove old repo");
+        let mut jobs = Vec::new();
+        for _ in 0..MISSING_ROOT_RETIRE_TICKS {
+            let observations = collect_root_observations(&state);
+            jobs.extend(
+                state
+                    .watch_registry()
+                    .record_absent_roots(&observations, MISSING_ROOT_RETIRE_TICKS),
+            );
+        }
+        assert!(
+            !registered(&state, "ordinary"),
+            "third real observation retires old registration"
+        );
+        assert_eq!(jobs.len(), 1, "ordinary job admitted");
+        match timing {
+            Pr786OrdinaryTiming::Admitted => {}
+            Pr786OrdinaryTiming::Parked => {
+                symlink(&repo, &repo).expect("ELOOP ancestor");
+                let failed = cleanup_retired_registration(&state, jobs.remove(0))
+                    .await
+                    .expect("ELOOP must park old job");
+                state.watch_registry().park_failed_cleanup(failed);
+                std::fs::remove_file(&repo).expect("remove ELOOP ancestor");
+            }
+        }
+        create_repo("pr786ordinarynew");
+        let (effective, _) =
+            hallouminate_config::resolve_for_cwd(&cfg, &repo, None).expect("resolve successor");
+        register_runtime_corpora(&state, Some(&config_path), &effective.corpora, &effective)
+            .expect("register exact successor");
+        assert_eq!(state.watch_registry().snapshot_roots()[0].0.corpus_key, key);
+        let result = crate::dispatch::dispatch(&state, request()).await;
+        let DaemonResponse::Ok { .. } = result else {
+            panic!("successor index must succeed: {result:?}");
+        };
+        let query = corpus("ordinary", root.to_str().expect("utf8"), &["**/*.md"]);
+        assert!(pr_786_followup_index_contains(&state, &query, "pr786ordinarynew", &note).await);
+        std::fs::remove_dir_all(&repo).expect("remove successor repo");
+        for _ in 0..2 {
+            retire_missing_registrations(&state, &tracker);
+        }
+        assert!(
+            registered(&state, "ordinary"),
+            "successor has only two absent observations"
+        );
+        match timing {
+            Pr786OrdinaryTiming::Admitted => {}
+            Pr786OrdinaryTiming::Parked => {
+                jobs = state.watch_registry().take_pending_cleanups();
+            }
+        }
+        for job in jobs {
+            spawn_retired_cleanup(&state, &tracker, job);
+        }
+        tracker.close();
+        tracker.wait().await;
+        assert_eq!(
+            store.list_files(&key).await.expect("successor files").len(),
+            1
+        );
+        assert!(
+            store
+                .corpus_chunk_stats(&key)
+                .await
+                .expect("successor chunks")
+                .total_chunks
+                > 0
+        );
+        assert!(
+            pr_786_followup_index_contains(&state, &query, "pr786ordinarynew", &note).await,
+            "old ordinary cleanup must not delete exact successor rows"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pr_786_admitted_ordinary_cleanup_preserves_exact_successor_rows() {
+        pr_786_ordinary_successor_survives_old_cleanup(Pr786OrdinaryTiming::Admitted).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pr_786_parked_ordinary_cleanup_preserves_exact_successor_rows() {
+        pr_786_ordinary_successor_survives_old_cleanup(Pr786OrdinaryTiming::Parked).await;
+    }
+
+    #[cfg(unix)]
+    #[derive(Clone, Copy)]
+    enum Pr786OrdinaryPairTiming {
+        NoSuccessor,
+        Admitted,
+        Parked,
+        BothReturn,
+        ReadyWhileAdmitted,
+    }
+
+    #[cfg(unix)]
+    async fn pr_786_ordinary_pair_cleanup(timing: Pr786OrdinaryPairTiming) {
+        use crate::ipc::{DaemonRequest, DaemonRequestPayload, DaemonResponse, IndexRequest};
+        use std::os::unix::fs::symlink;
+
+        let separate_siblings = match timing {
+            Pr786OrdinaryPairTiming::BothReturn | Pr786OrdinaryPairTiming::ReadyWhileAdmitted => {
+                true
+            }
+            Pr786OrdinaryPairTiming::NoSuccessor
+            | Pr786OrdinaryPairTiming::Admitted
+            | Pr786OrdinaryPairTiming::Parked => false,
+        };
+        let ready_while_admitted = match timing {
+            Pr786OrdinaryPairTiming::ReadyWhileAdmitted => true,
+            Pr786OrdinaryPairTiming::NoSuccessor
+            | Pr786OrdinaryPairTiming::Admitted
+            | Pr786OrdinaryPairTiming::Parked
+            | Pr786OrdinaryPairTiming::BothReturn => false,
+        };
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().canonicalize().expect("canonical tempdir");
+        let a_parent = base.join("a-parent");
+        let a = a_parent.join("a");
+        let b = base.join("b");
+        let c = base.join("c");
+        let a_held = base.join("a-held");
+        let b_held = base.join("b-held");
+        let repo = base.join("repo");
+        let repo_held = base.join("repo-held");
+        for path in [&a, &b, &repo] {
+            std::fs::create_dir_all(path).expect("fixture directory");
+        }
+        std::fs::create_dir(repo.join(".git")).expect("git boundary");
+        std::fs::create_dir(repo.join(".hallouminate")).expect("config dir");
+        symlink(&a, repo.join("a")).expect("a alias");
+        symlink(&b, repo.join("b")).expect("b alias");
+        let config_path = repo.join(".hallouminate/config.toml");
+        std::fs::write(
+            &config_path,
+            "[[corpus]]\nname = \"ordinary_pair\"\npaths = [\"a\", \"b\"]\nglobs = [\"**/*.md\"]\n",
+        )
+        .expect("config");
+        let a_note = a.join("a.md");
+        let b_note = b.join("b.md");
+        std::fs::write(&a_note, "# A\n\npr786ordinaryreturna\n").expect("a note");
+        std::fs::write(&b_note, "# B\n\npr786ordinaryreturnb\n").expect("b note");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.daemon.maintenance_interval_secs = 0;
+        cfg.security.allow_repo_paths_outside_root = vec![
+            a.display().to_string(),
+            b.display().to_string(),
+            c.display().to_string(),
+        ];
+        cfg.storage.ground_dir = base.join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg.clone(), None).await.expect("open");
+        let result = crate::dispatch::dispatch(
+            &state,
+            DaemonRequest {
+                cwd: repo.clone(),
+                payload: DaemonRequestPayload::Index(IndexRequest {
+                    corpus: Some("ordinary_pair".into()),
+                    paths_from: None,
+                    strict: false,
+                    background: false,
+                }),
+            },
+        )
+        .await;
+        let DaemonResponse::Ok { .. } = result else {
+            panic!("initial index must succeed: {result:?}");
+        };
+        let (effective, _) =
+            hallouminate_config::resolve_for_cwd(&cfg, &repo, None).expect("resolve repo");
+        register_runtime_corpora(&state, Some(&config_path), &effective.corpora, &effective)
+            .expect("register pair");
+        let store = state
+            .resources_for(&effective)
+            .await
+            .expect("resources")
+            .store
+            .clone();
+        let a_query = corpus("ordinary_pair", a.to_str().expect("utf8"), &["**/*.md"]);
+        let b_query = corpus("ordinary_pair", b.to_str().expect("utf8"), &["**/*.md"]);
+        let a_key = a_query.corpus_keys().remove(0);
+        let b_key = b_query.corpus_keys().remove(0);
+        assert_eq!(store.list_files(&a_key).await.expect("a rows").len(), 1);
+        assert_eq!(store.list_files(&b_key).await.expect("b rows").len(), 1);
+        let c_live = if separate_siblings {
+            let live_repo = base.join("live-repo");
+            std::fs::create_dir(&c).expect("live c root");
+            std::fs::create_dir(&live_repo).expect("live repo");
+            std::fs::create_dir(live_repo.join(".git")).expect("live git boundary");
+            std::fs::create_dir(live_repo.join(".hallouminate")).expect("live config dir");
+            symlink(&c, live_repo.join("c")).expect("live c alias");
+            let live_config = live_repo.join(".hallouminate/config.toml");
+            std::fs::write(
+                &live_config,
+                "[[corpus]]\nname = \"ordinary_live\"\npaths = [\"c\"]\nglobs = [\"**/*.md\"]\n",
+            )
+            .expect("live config");
+            let c_note = c.join("c.md");
+            std::fs::write(&c_note, "# C\n\npr786ordinarylivec\n").expect("live c note");
+            let result = crate::dispatch::dispatch(
+                &state,
+                DaemonRequest {
+                    cwd: live_repo.clone(),
+                    payload: DaemonRequestPayload::Index(IndexRequest {
+                        corpus: Some("ordinary_live".into()),
+                        paths_from: None,
+                        strict: false,
+                        background: false,
+                    }),
+                },
+            )
+            .await;
+            let DaemonResponse::Ok { .. } = result else {
+                panic!("live index must succeed: {result:?}");
+            };
+            let (live_effective, _) = hallouminate_config::resolve_for_cwd(&cfg, &live_repo, None)
+                .expect("resolve live repo");
+            register_runtime_corpora(
+                &state,
+                Some(&live_config),
+                &live_effective.corpora,
+                &live_effective,
+            )
+            .expect("register live c");
+            let c_query = corpus("ordinary_live", c.to_str().expect("utf8"), &["**/*.md"]);
+            let c_key = c_query.corpus_keys().remove(0);
+            assert_eq!(
+                store.list_files(&c_key).await.expect("live c rows").len(),
+                1
+            );
+            Some((c_query, c_key, c_note))
+        } else {
+            None
+        };
+
+        std::fs::rename(&repo, &repo_held).expect("hide checkout");
+        std::fs::rename(&a_parent, &a_held).expect("hide a");
+        std::fs::rename(&b, &b_held).expect("hide b");
+        let tracker = TaskTracker::new();
+        let mut jobs = Vec::new();
+        for _ in 0..MISSING_ROOT_RETIRE_TICKS {
+            let observations = collect_root_observations(&state);
+            jobs.extend(
+                state
+                    .watch_registry()
+                    .record_absent_roots(&observations, MISSING_ROOT_RETIRE_TICKS),
+            );
+        }
+        assert_eq!(
+            jobs.len(),
+            1,
+            "ordinary group admitted after three real misses"
+        );
+        assert_eq!(jobs[0].roots, vec![a.clone(), b.clone()]);
+        match timing {
+            Pr786OrdinaryPairTiming::NoSuccessor
+            | Pr786OrdinaryPairTiming::BothReturn
+            | Pr786OrdinaryPairTiming::ReadyWhileAdmitted
+            | Pr786OrdinaryPairTiming::Admitted => {}
+            Pr786OrdinaryPairTiming::Parked => {
+                symlink(&a_parent, &a_parent).expect("ELOOP at old a ancestor");
+                let failed = cleanup_retired_registration(&state, jobs.remove(0))
+                    .await
+                    .expect("ELOOP must park old ordinary job");
+                state.watch_registry().park_failed_cleanup(failed);
+                std::fs::remove_file(&a_parent).expect("remove ELOOP");
+            }
+        }
+        match timing {
+            Pr786OrdinaryPairTiming::NoSuccessor
+            | Pr786OrdinaryPairTiming::BothReturn
+            | Pr786OrdinaryPairTiming::ReadyWhileAdmitted => {}
+            Pr786OrdinaryPairTiming::Admitted | Pr786OrdinaryPairTiming::Parked => {
+                std::fs::rename(&a_held, &a_parent).expect("restore a");
+                std::fs::rename(&repo_held, &repo).expect("restore checkout");
+                std::fs::create_dir(&c).expect("new c root");
+                symlink(&c, repo.join("c")).expect("new c alias");
+                let c_note = c.join("c.md");
+                std::fs::write(&a_note, "# A\n\npr786ordinarysuccessora\n")
+                    .expect("fresh a marker");
+                std::fs::write(&c_note, "# C\n\npr786ordinarysuccessorc\n")
+                    .expect("fresh c marker");
+                std::fs::write(
+                    &config_path,
+                    "[[corpus]]\nname = \"ordinary_pair\"\npaths = [\"a\", \"c\"]\nglobs = [\"**/*.md\"]\n",
+                )
+                .expect("partial config");
+                reload_repo_layer(
+                    &state,
+                    &config_path,
+                    &tracker,
+                    &mut ReloadFailureMemo::new(),
+                );
+                let (effective, _) = hallouminate_config::resolve_for_cwd(&cfg, &repo, None)
+                    .expect("resolve partial repo");
+                assert_eq!(effective.corpora.len(), 1);
+                assert_eq!(effective.corpora[0].paths.len(), 2);
+                let roots = watch_roots_for(&effective.corpora[0]);
+                assert!(state.watch_registry().is_registered_unchanged(
+                    &registry::ConfigSource::RepoLayer(config_path.clone()),
+                    &effective.corpora[0],
+                    &std::sync::Arc::new(effective.clone()),
+                    &roots,
+                ));
+                let result = crate::dispatch::dispatch(
+                    &state,
+                    DaemonRequest {
+                        cwd: repo.clone(),
+                        payload: DaemonRequestPayload::Index(IndexRequest {
+                            corpus: Some("ordinary_pair".into()),
+                            paths_from: None,
+                            strict: false,
+                            background: false,
+                        }),
+                    },
+                )
+                .await;
+                let DaemonResponse::Ok { .. } = result else {
+                    panic!("partial index must succeed: {result:?}");
+                };
+                let c_query = corpus("ordinary_pair", c.to_str().expect("utf8"), &["**/*.md"]);
+                let c_key = c_query.corpus_keys().remove(0);
+                assert_eq!(
+                    store.list_files(&a_key).await.expect("fresh a rows").len(),
+                    1
+                );
+                assert_eq!(
+                    store.list_files(&c_key).await.expect("fresh c rows").len(),
+                    1
+                );
+                assert!(
+                    pr_786_followup_index_contains(
+                        &state,
+                        &a_query,
+                        "pr786ordinarysuccessora",
+                        &a_note
+                    )
+                    .await
+                );
+                assert!(
+                    pr_786_followup_index_contains(
+                        &state,
+                        &c_query,
+                        "pr786ordinarysuccessorc",
+                        &c_note
+                    )
+                    .await
+                );
+                std::fs::rename(&a_parent, &a_held).expect("hide fresh a without deleting bytes");
+                let jobs = match timing {
+                    Pr786OrdinaryPairTiming::NoSuccessor
+                    | Pr786OrdinaryPairTiming::BothReturn
+                    | Pr786OrdinaryPairTiming::ReadyWhileAdmitted => {
+                        panic!("successor branch requires successor")
+                    }
+                    Pr786OrdinaryPairTiming::Admitted => jobs,
+                    Pr786OrdinaryPairTiming::Parked => {
+                        state.watch_registry().take_pending_cleanups()
+                    }
+                };
+                for job in jobs {
+                    spawn_retired_cleanup(&state, &tracker, job);
+                }
+                tracker.close();
+                tracker.wait().await;
+                assert_eq!(
+                    store
+                        .list_files(&a_key)
+                        .await
+                        .expect("protected a rows")
+                        .len(),
+                    1,
+                    "old ordinary cleanup must not erase canonical a rows"
+                );
+                assert!(
+                    pr_786_followup_index_contains(
+                        &state,
+                        &a_query,
+                        "pr786ordinarysuccessora",
+                        &a_note
+                    )
+                    .await
+                );
+                assert_eq!(
+                    store
+                        .list_files(&b_key)
+                        .await
+                        .expect("retired b rows")
+                        .len(),
+                    0
+                );
+                assert!(
+                    !pr_786_followup_index_contains(
+                        &state,
+                        &b_query,
+                        "pr786ordinaryreturnb",
+                        &b_note
+                    )
+                    .await
+                );
+                assert_eq!(
+                    store.list_files(&c_key).await.expect("live c rows").len(),
+                    1
+                );
+                assert!(
+                    pr_786_followup_index_contains(
+                        &state,
+                        &c_query,
+                        "pr786ordinarysuccessorc",
+                        &c_note
+                    )
+                    .await
+                );
+                assert_eq!(
+                    std::fs::read_to_string(a_held.join("a/a.md")).expect("a source bytes"),
+                    "# A\n\npr786ordinarysuccessora\n"
+                );
+                return;
+            }
+        }
+        if separate_siblings {
+            let Some((c_query, c_key, c_note)) = c_live else {
+                panic!("live c fixture is required");
+            };
+            std::fs::rename(&a_held, &a_parent).expect("a returns before final probe");
+            std::fs::rename(&b_held, &b).expect("b returns before final probe");
+            for job in jobs {
+                spawn_retired_cleanup(&state, &tracker, job);
+            }
+            tracker.close();
+            tracker.wait().await;
+            for (key, query, marker, note) in [
+                (&a_key, &a_query, "pr786ordinaryreturna", &a_note),
+                (&b_key, &b_query, "pr786ordinaryreturnb", &b_note),
+            ] {
+                assert_eq!(store.list_files(key).await.expect("returned rows").len(), 1);
+                assert!(pr_786_followup_index_contains(&state, query, marker, note).await);
+            }
+            std::fs::rename(&a_parent, &a_held).expect("hide a again");
+            let tracker = TaskTracker::new();
+            for _ in 0..MISSING_ROOT_RETIRE_TICKS - 1 {
+                retire_missing_registrations(&state, &tracker);
+                assert_eq!(
+                    store
+                        .list_files(&a_key)
+                        .await
+                        .expect("a before threshold")
+                        .len(),
+                    1
+                );
+                assert_eq!(
+                    store
+                        .list_files(&b_key)
+                        .await
+                        .expect("b before threshold")
+                        .len(),
+                    1
+                );
+            }
+            retire_missing_registrations(&state, &tracker);
+            let jobs = state.watch_registry().take_pending_cleanups();
+            assert_eq!(jobs.len(), 1, "third a miss admits one cleanup");
+            if ready_while_admitted {
+                std::fs::rename(&b, &b_held).expect("hide b while a job is admitted");
+                for _ in 0..MISSING_ROOT_RETIRE_TICKS {
+                    retire_missing_registrations(&state, &tracker);
+                }
+                assert_eq!(
+                    store.list_files(&b_key).await.expect("b before job").len(),
+                    1
+                );
+            }
+            for job in jobs {
+                spawn_retired_cleanup(&state, &tracker, job);
+            }
+            tracker.close();
+            tracker.wait().await;
+            assert_eq!(
+                store
+                    .list_files(&a_key)
+                    .await
+                    .expect("retired a rows")
+                    .len(),
+                0
+            );
+            assert!(
+                !pr_786_followup_index_contains(&state, &a_query, "pr786ordinaryreturna", &a_note)
+                    .await
+            );
+            assert_eq!(
+                store
+                    .list_files(&b_key)
+                    .await
+                    .expect("retained b rows")
+                    .len(),
+                1
+            );
+            assert_eq!(
+                store.list_files(&c_key).await.expect("live c rows").len(),
+                1
+            );
+            assert!(
+                pr_786_followup_index_contains(&state, &c_query, "pr786ordinarylivec", &c_note)
+                    .await
+            );
+            assert!(
+                pr_786_followup_index_contains(&state, &b_query, "pr786ordinaryreturnb", &b_note)
+                    .await
+            );
+            let ticket_after_a = state.watch_registry().retired_runtime_count();
+            let b_jobs = if !ready_while_admitted {
+                std::fs::rename(&b, &b_held).expect("hide b after a cleanup");
+                let tracker = TaskTracker::new();
+                for _ in 0..MISSING_ROOT_RETIRE_TICKS - 1 {
+                    retire_missing_registrations(&state, &tracker);
+                    assert_eq!(
+                        store
+                            .list_files(&b_key)
+                            .await
+                            .expect("b before threshold")
+                            .len(),
+                        1
+                    );
+                    assert!(
+                        pr_786_followup_index_contains(
+                            &state,
+                            &b_query,
+                            "pr786ordinaryreturnb",
+                            &b_note
+                        )
+                        .await
+                    );
+                }
+                retire_missing_registrations(&state, &tracker);
+                let jobs = state.watch_registry().take_pending_cleanups();
+                let count = jobs.len();
+                for job in jobs {
+                    spawn_retired_cleanup(&state, &tracker, job);
+                }
+                tracker.close();
+                tracker.wait().await;
+                count
+            } else {
+                let tracker = TaskTracker::new();
+                let jobs = state.watch_registry().take_pending_cleanups();
+                let count = jobs.len();
+                for job in jobs {
+                    spawn_retired_cleanup(&state, &tracker, job);
+                }
+                tracker.close();
+                tracker.wait().await;
+                count
+            };
+            assert_eq!(
+                store
+                    .list_files(&b_key)
+                    .await
+                    .expect("retired b rows")
+                    .len(),
+                0
+            );
+            assert!(
+                !pr_786_followup_index_contains(&state, &b_query, "pr786ordinaryreturnb", &b_note)
+                    .await
+            );
+            assert_eq!(ticket_after_a, 1, "one ticket remains after A");
+            assert_eq!(b_jobs, 1, "B needs one admitted cleanup");
+            assert_eq!(state.watch_registry().retired_runtime_count(), 0);
+            assert_eq!(
+                store.list_files(&c_key).await.expect("live c rows").len(),
+                1
+            );
+            assert!(
+                pr_786_followup_index_contains(&state, &c_query, "pr786ordinarylivec", &c_note)
+                    .await
+            );
+            assert_eq!(
+                std::fs::read_to_string(&c_note).expect("live c bytes"),
+                "# C\n\npr786ordinarylivec\n"
+            );
+            assert_eq!(
+                std::fs::read_to_string(a_held.join("a/a.md")).expect("held a bytes"),
+                "# A\n\npr786ordinaryreturna\n"
+            );
+            assert_eq!(
+                std::fs::read_to_string(b_held.join("b.md")).expect("held b bytes"),
+                "# B\n\npr786ordinaryreturnb\n"
+            );
+            return;
+        }
+        std::fs::rename(&a_held, &a_parent).expect("a returns before final probe");
+        for job in jobs {
+            spawn_retired_cleanup(&state, &tracker, job);
+        }
+        tracker.close();
+        tracker.wait().await;
+        assert_eq!(
+            store
+                .list_files(&a_key)
+                .await
+                .expect("returned a rows")
+                .len(),
+            1
+        );
+        assert!(
+            pr_786_followup_index_contains(&state, &a_query, "pr786ordinaryreturna", &a_note).await
+        );
+        assert_eq!(
+            store
+                .list_files(&b_key)
+                .await
+                .expect("retired b rows")
+                .len(),
+            0
+        );
+        assert!(
+            !pr_786_followup_index_contains(&state, &b_query, "pr786ordinaryreturnb", &b_note)
+                .await
+        );
+        assert_eq!(
+            std::fs::read_to_string(&a_note).expect("returned a bytes"),
+            "# A\n\npr786ordinaryreturna\n"
+        );
+
+        std::fs::rename(&a_parent, &a_held).expect("a absent again");
+        let tracker = TaskTracker::new();
+        for _ in 0..MISSING_ROOT_RETIRE_TICKS - 1 {
+            retire_missing_registrations(&state, &tracker);
+            assert_eq!(
+                store
+                    .list_files(&a_key)
+                    .await
+                    .expect("a before threshold")
+                    .len(),
+                1
+            );
+            assert!(
+                pr_786_followup_index_contains(&state, &a_query, "pr786ordinaryreturna", &a_note)
+                    .await
+            );
+        }
+        retire_missing_registrations(&state, &tracker);
+        for job in state.watch_registry().take_pending_cleanups() {
+            spawn_retired_cleanup(&state, &tracker, job);
+        }
+        tracker.close();
+        tracker.wait().await;
+        assert_eq!(
+            store
+                .list_files(&a_key)
+                .await
+                .expect("retired returned a rows")
+                .len(),
+            0,
+            "third fresh absence must delete the returned ordinary root"
+        );
+        assert!(
+            !pr_786_followup_index_contains(&state, &a_query, "pr786ordinaryreturna", &a_note)
+                .await
+        );
+        assert_eq!(
+            store
+                .list_files(&b_key)
+                .await
+                .expect("b stays retired")
+                .len(),
+            0
+        );
+        assert_eq!(
+            std::fs::read_to_string(a_held.join("a/a.md")).expect("held a bytes"),
+            "# A\n\npr786ordinaryreturna\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pr_786_returned_ordinary_root_retires_after_fresh_absence_sequence() {
+        pr_786_ordinary_pair_cleanup(Pr786OrdinaryPairTiming::NoSuccessor).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pr_786_admitted_ordinary_partial_successor_preserves_a_rows() {
+        pr_786_ordinary_pair_cleanup(Pr786OrdinaryPairTiming::Admitted).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pr_786_parked_ordinary_partial_successor_preserves_a_rows() {
+        pr_786_ordinary_pair_cleanup(Pr786OrdinaryPairTiming::Parked).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pr_786_two_returned_ordinary_siblings_retire_separately() {
+        pr_786_ordinary_pair_cleanup(Pr786OrdinaryPairTiming::BothReturn).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pr_786_ready_ordinary_sibling_survives_admitted_job() {
+        pr_786_ordinary_pair_cleanup(Pr786OrdinaryPairTiming::ReadyWhileAdmitted).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pr_786_detached_two_root_group_cleans_only_missing_returned_target() {
+        use crate::ipc::{DaemonRequest, DaemonRequestPayload, DaemonResponse, IndexRequest};
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().canonicalize().expect("canonical tempdir");
+        let a = base.join("a");
+        let b = base.join("b");
+        let repo = base.join("repo");
+        for path in [&a, &b, &repo] {
+            std::fs::create_dir(path).expect("fixture directory");
+        }
+        std::fs::create_dir(repo.join(".git")).expect("git boundary");
+        std::fs::create_dir(repo.join(".hallouminate")).expect("config dir");
+        symlink(&a, repo.join("a")).expect("a alias");
+        symlink(&b, repo.join("b")).expect("b alias");
+        let config_path = repo.join(".hallouminate/config.toml");
+        std::fs::write(
+            &config_path,
+            "[[corpus]]\nname = \"pair\"\npaths = [\"a\", \"b\"]\nglobs = [\"**/*.md\"]\n",
+        )
+        .expect("config");
+        let b_note = b.join("b.md");
+        std::fs::write(a.join("a.md"), "# A\n\npr786groupa\n").expect("a note");
+        std::fs::write(&b_note, "# B\n\npr786groupb\n").expect("b note");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.daemon.maintenance_interval_secs = 0;
+        cfg.security.allow_repo_paths_outside_root =
+            vec![a.display().to_string(), b.display().to_string()];
+        cfg.storage.ground_dir = base.join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg.clone(), None).await.expect("open");
+        let result = crate::dispatch::dispatch(
+            &state,
+            DaemonRequest {
+                cwd: repo.clone(),
+                payload: DaemonRequestPayload::Index(IndexRequest {
+                    corpus: Some("pair".into()),
+                    paths_from: None,
+                    strict: false,
+                    background: false,
+                }),
+            },
+        )
+        .await;
+        let DaemonResponse::Ok { .. } = result else {
+            panic!("real index must succeed: {result:?}");
+        };
+        let (effective, _) =
+            hallouminate_config::resolve_for_cwd(&cfg, &repo, None).expect("resolve repo");
+        register_runtime_corpora(&state, Some(&config_path), &effective.corpora, &effective)
+            .expect("register pair");
+        let a_key = corpus("pair", a.to_str().expect("utf8"), &["**/*.md"])
+            .corpus_keys()
+            .remove(0);
+        let b_key = corpus("pair", b.to_str().expect("utf8"), &["**/*.md"])
+            .corpus_keys()
+            .remove(0);
+        let store = state
+            .resources_for(&effective)
+            .await
+            .expect("resources")
+            .store
+            .clone();
+        assert_eq!(store.list_files(&a_key).await.expect("a rows").len(), 1);
+        assert_eq!(store.list_files(&b_key).await.expect("b rows").len(), 1);
+
+        std::fs::remove_dir_all(&repo).expect("remove checkout");
+        let tracker = TaskTracker::new();
+        for _ in 0..MISSING_ROOT_RETIRE_TICKS {
+            retire_missing_registrations(&state, &tracker);
+        }
+        assert_eq!(state.watch_registry().detached_probes().len(), 1);
+        std::fs::remove_dir_all(&a).expect("a absent");
+        std::fs::remove_dir_all(&b).expect("b absent");
+        for _ in 0..MISSING_ROOT_RETIRE_TICKS {
+            retire_missing_registrations(&state, &tracker);
+        }
+        assert!(state.watch_registry().detached_probes().is_empty());
+        std::fs::create_dir(&a).expect("a returns before cleanup");
+        std::fs::create_dir(&b).expect("b returns before cleanup");
+        std::fs::write(&b_note, "# B\n\npr786groupb\n").expect("b returns with content");
+        let jobs = state.watch_registry().take_pending_cleanups();
+        assert_eq!(jobs.len(), 1, "three absent observations queue one group");
+        for job in jobs {
+            spawn_retired_cleanup(&state, &tracker, job);
+        }
+        tracker.close();
+        tracker.wait().await;
+        let detached = state.watch_registry().detached_probes();
+        assert_eq!(detached.len(), 1, "present roots are rearmed");
+        assert_eq!(detached[0].1.len(), 2, "both roots remain in the group");
+        assert_eq!(
+            store
+                .list_files(&a_key)
+                .await
+                .expect("a rearmed rows")
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .list_files(&b_key)
+                .await
+                .expect("b rearmed rows")
+                .len(),
+            1
+        );
+        std::fs::remove_dir(&a).expect("only a disappears");
+        let tracker = TaskTracker::new();
+        for _ in 0..MISSING_ROOT_RETIRE_TICKS - 1 {
+            retire_missing_registrations(&state, &tracker);
+            assert_eq!(
+                store
+                    .list_files(&a_key)
+                    .await
+                    .expect("a rows before threshold")
+                    .len(),
+                1
+            );
+            assert!(state.watch_registry().take_pending_cleanups().is_empty());
+        }
+        retire_missing_registrations(&state, &tracker);
+        tracker.close();
+        tracker.wait().await;
+        assert_eq!(state.watch_registry().detached_probes().len(), 1);
+        let jobs = state.watch_registry().take_pending_cleanups();
+        assert_eq!(jobs.len(), 1, "only the absent returned root is queued");
+        assert_eq!(jobs[0].roots, vec![a.clone()]);
+        let tracker = TaskTracker::new();
+        for job in jobs {
+            spawn_retired_cleanup(&state, &tracker, job);
+        }
+        tracker.close();
+        tracker.wait().await;
+        assert!(state.watch_registry().take_pending_cleanups().is_empty());
+        assert_eq!(
+            store
+                .list_files(&a_key)
+                .await
+                .expect("a deleted rows")
+                .len(),
+            0
+        );
+        assert_eq!(
+            store
+                .list_files(&b_key)
+                .await
+                .expect("b retained rows")
+                .len(),
+            1
+        );
+        assert!(
+            !pr_786_followup_index_contains(
+                &state,
+                &corpus("pair", a.to_str().expect("utf8"), &["**/*.md"]),
+                "pr786groupa",
+                &a.join("a.md"),
+            )
+            .await
+        );
+        assert_eq!(
+            std::fs::read_to_string(&b_note).expect("b bytes"),
+            "# B\n\npr786groupb\n"
+        );
+        assert!(
+            pr_786_followup_index_contains(
+                &state,
+                &corpus("pair", b.to_str().expect("utf8"), &["**/*.md"]),
+                "pr786groupb",
+                &b_note,
+            )
+            .await,
+            "live b content remains indexed"
+        );
+        let pressure_cfg = std::sync::Arc::new(cfg);
+        for number in 0..255 {
+            let name = format!("pressure-{number}");
+            let candidate = CorpusConfig {
+                name: name.clone(),
+                paths: vec![],
+                globs: vec![],
+                exclude: vec![],
+                global: false,
+            };
+            assert_eq!(
+                state.watch_registry().register(
+                    registry::ConfigSource::RepoLayer(base.join(format!("{name}.toml"))),
+                    candidate.clone(),
+                    pressure_cfg.clone(),
+                    watch_roots_for(&candidate),
+                ),
+                registry::RegisterOutcome::New,
+            );
+        }
+        let overflow = CorpusConfig {
+            name: "overflow".into(),
+            paths: vec![],
+            globs: vec![],
+            exclude: vec![],
+            global: false,
+        };
+        assert_eq!(
+            state.watch_registry().register(
+                registry::ConfigSource::RepoLayer(base.join("overflow.toml")),
+                overflow.clone(),
+                pressure_cfg,
+                watch_roots_for(&overflow),
+            ),
+            registry::RegisterOutcome::LimitReached,
+            "detached obligation still holds one runtime ticket"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pr_786_admitted_group_cleanup_preserves_reordered_successor_rows() {
+        use crate::ipc::{DaemonRequest, DaemonRequestPayload, DaemonResponse, IndexRequest};
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().canonicalize().expect("canonical tempdir");
+        let a = base.join("a");
+        let b = base.join("b");
+        let c = base.join("c");
+        let repo = base.join("repo");
+        for path in [&a, &b, &c, &repo] {
+            std::fs::create_dir(path).expect("fixture directory");
+        }
+        std::fs::create_dir(repo.join(".git")).expect("git boundary");
+        std::fs::create_dir(repo.join(".hallouminate")).expect("config dir");
+        for (path, name) in [(&a, "a"), (&b, "b"), (&c, "c")] {
+            symlink(path, repo.join(name)).expect("alias");
+        }
+        let config_path = repo.join(".hallouminate/config.toml");
+        let old_config =
+            "[[corpus]]\nname = \"pair\"\npaths = [\"a\", \"b\", \"c\"]\nglobs = [\"**/*.md\"]\n";
+        let new_config =
+            "[[corpus]]\nname = \"pair\"\npaths = [\"a\", \"c\", \"b\"]\nglobs = [\"**/*.md\"]\n";
+        std::fs::write(&config_path, old_config).expect("old config");
+        let note = a.join("a.md");
+        std::fs::write(&note, "# A\n\npr786oldgroup\n").expect("old a note");
+        std::fs::write(b.join("b.md"), "# B\n\npr786groupb\n").expect("b note");
+        std::fs::write(c.join("c.md"), "# C\n\npr786groupc\n").expect("c note");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.daemon.maintenance_interval_secs = 0;
+        cfg.security.allow_repo_paths_outside_root = vec![
+            a.display().to_string(),
+            b.display().to_string(),
+            c.display().to_string(),
+        ];
+        cfg.storage.ground_dir = base.join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg.clone(), None).await.expect("open");
+        let index = || DaemonRequest {
+            cwd: repo.clone(),
+            payload: DaemonRequestPayload::Index(IndexRequest {
+                corpus: Some("pair".into()),
+                paths_from: None,
+                strict: false,
+                background: false,
+            }),
+        };
+        let result = crate::dispatch::dispatch(&state, index()).await;
+        let DaemonResponse::Ok { .. } = result else {
+            panic!("old index must succeed: {result:?}");
+        };
+        let (effective, _) =
+            hallouminate_config::resolve_for_cwd(&cfg, &repo, None).expect("resolve old repo");
+        register_runtime_corpora(&state, Some(&config_path), &effective.corpora, &effective)
+            .expect("register old roots");
+        let query = corpus("pair", a.to_str().expect("utf8"), &["**/*.md"]);
+        let key = query.corpus_keys().remove(0);
+        let store = state
+            .resources_for(&effective)
+            .await
+            .expect("resources")
+            .store
+            .clone();
+        assert!(pr_786_followup_index_contains(&state, &query, "pr786oldgroup", &note).await);
+        let tracker = TaskTracker::new();
+        std::fs::remove_dir_all(&repo).expect("remove old checkout");
+        for _ in 0..MISSING_ROOT_RETIRE_TICKS {
+            retire_missing_registrations(&state, &tracker);
+        }
+        assert_eq!(state.watch_registry().detached_probes().len(), 1);
+        for path in [&a, &b, &c] {
+            std::fs::remove_dir_all(path).expect("remove old root");
+        }
+        for _ in 0..MISSING_ROOT_RETIRE_TICKS {
+            retire_missing_registrations(&state, &tracker);
+        }
+        let admitted = state.watch_registry().take_pending_cleanups();
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(admitted[0].roots.len(), 3);
+        let old_token = admitted[0].detached.clone().expect("detached token");
+
+        for path in [&a, &b, &c, &repo] {
+            std::fs::create_dir(path).expect("new fixture directory");
+        }
+        std::fs::create_dir(repo.join(".git")).expect("new git boundary");
+        std::fs::create_dir(repo.join(".hallouminate")).expect("new config dir");
+        for (path, name) in [(&a, "a"), (&b, "b"), (&c, "c")] {
+            symlink(path, repo.join(name)).expect("new alias");
+        }
+        std::fs::write(&config_path, new_config).expect("new config");
+        std::fs::write(&note, "# A\n\npr786newgroup\n").expect("new a note");
+        std::fs::write(b.join("b.md"), "# B\n\npr786newgroupb\n").expect("new b note");
+        std::fs::write(c.join("c.md"), "# C\n\npr786newgroupc\n").expect("new c note");
+        reload_repo_layer(
+            &state,
+            &config_path,
+            &tracker,
+            &mut ReloadFailureMemo::new(),
+        );
+        let (effective, _) = hallouminate_config::resolve_for_cwd(&cfg, &repo, None)
+            .expect("resolve reordered repo");
+        let roots = watch_roots_for(&effective.corpora[0]);
+        assert!(state.watch_registry().is_registered_unchanged(
+            &registry::ConfigSource::RepoLayer(config_path.clone()),
+            &effective.corpora[0],
+            &std::sync::Arc::new(effective.clone()),
+            &roots,
+        ));
+        let result = crate::dispatch::dispatch(&state, index()).await;
+        let DaemonResponse::Ok { .. } = result else {
+            panic!("successor index must succeed: {result:?}");
+        };
+        assert!(pr_786_followup_index_contains(&state, &query, "pr786newgroup", &note).await);
+        assert_eq!(
+            store
+                .list_files(&key)
+                .await
+                .expect("new a rows before cleanup")
+                .len(),
+            1
+        );
+        assert!(!old_token.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(state.watch_registry().detached_probes().is_empty());
+        std::fs::remove_dir_all(&repo).expect("remove new checkout");
+        for path in [&a, &b, &c] {
+            std::fs::remove_dir_all(path).expect("remove new root");
+        }
+        for job in admitted {
+            spawn_retired_cleanup(&state, &tracker, job);
+        }
+        tracker.close();
+        tracker.wait().await;
+        assert_eq!(store.list_files(&key).await.expect("new a rows").len(), 1);
+        assert!(
+            store
+                .corpus_chunk_stats(&key)
+                .await
+                .expect("new a chunks")
+                .total_chunks
+                > 0
+        );
+        assert!(
+            pr_786_followup_index_contains(&state, &query, "pr786newgroup", &note).await,
+            "an admitted old job cannot delete the reordered successor's new rows"
+        );
+        for (path, marker) in [(&b, "pr786newgroupb"), (&c, "pr786newgroupc")] {
+            let corpus = corpus("pair", path.to_str().expect("utf8"), &["**/*.md"]);
+            let key = corpus.corpus_keys().remove(0);
+            let file = path.join(format!(
+                "{}.md",
+                path.file_name().expect("root name").to_string_lossy()
+            ));
+            assert_eq!(
+                store.list_files(&key).await.expect("successor rows").len(),
+                1
+            );
+            assert!(
+                store
+                    .corpus_chunk_stats(&key)
+                    .await
+                    .expect("successor chunks")
+                    .total_chunks
+                    > 0
+            );
+            assert!(pr_786_followup_index_contains(&state, &corpus, marker, &file).await);
+        }
+    }
+
+    #[cfg(unix)]
+    enum Pr786OldJobTiming {
+        Queued,
+        Admitted,
+    }
+
+    #[cfg(unix)]
+    async fn pr_786_exact_successor_survives_old_cleanup(timing: Pr786OldJobTiming) {
+        use crate::ipc::{DaemonRequest, DaemonRequestPayload, DaemonResponse, IndexRequest};
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().canonicalize().expect("canonical tempdir");
+        let target = base.join("target");
+        let repo = base.join("repo");
+        std::fs::create_dir(&target).expect("target");
+        std::fs::create_dir(&repo).expect("repo");
+        std::fs::create_dir(repo.join(".git")).expect("git");
+        std::fs::create_dir(repo.join(".hallouminate")).expect("config dir");
+        symlink(&target, repo.join("alias")).expect("alias");
+        let config_path = repo.join(".hallouminate/config.toml");
+        let config = "[[corpus]]\nname = \"alias\"\npaths = [\"alias\"]\nglobs = [\"**/*.md\"]\n";
+        std::fs::write(&config_path, config).expect("config");
+        let note = target.join("note.md");
+        std::fs::write(&note, "# Note\n\npr786oldindex\n").expect("old note");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.daemon.maintenance_interval_secs = 0;
+        cfg.security.allow_repo_paths_outside_root = vec![target.display().to_string()];
+        cfg.storage.ground_dir = base.join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg.clone(), None).await.expect("open");
+        let request = || DaemonRequest {
+            cwd: repo.clone(),
+            payload: DaemonRequestPayload::Index(IndexRequest {
+                corpus: Some("alias".into()),
+                paths_from: None,
+                strict: false,
+                background: false,
+            }),
+        };
+        let result = crate::dispatch::dispatch(&state, request()).await;
+        let DaemonResponse::Ok { .. } = result else {
+            panic!("old index must succeed: {result:?}");
+        };
+        let (effective, _) =
+            hallouminate_config::resolve_for_cwd(&cfg, &repo, None).expect("resolve old repo");
+        register_runtime_corpora(&state, Some(&config_path), &effective.corpora, &effective)
+            .expect("register old source");
+        let key = state.watch_registry().snapshot_roots()[0]
+            .0
+            .corpus_key
+            .clone();
+        let store = state
+            .resources_for(&effective)
+            .await
+            .expect("resources")
+            .store
+            .clone();
+        assert_eq!(store.list_files(&key).await.expect("old files").len(), 1);
+        assert!(
+            store
+                .corpus_chunk_stats(&key)
+                .await
+                .expect("old chunks")
+                .total_chunks
+                > 0
+        );
+        let tracker = TaskTracker::new();
+        std::fs::remove_dir_all(&repo).expect("remove old repo");
+        for _ in 0..MISSING_ROOT_RETIRE_TICKS {
+            retire_missing_registrations(&state, &tracker);
+        }
+        assert_eq!(state.watch_registry().detached_probes().len(), 1);
+        std::fs::remove_dir_all(&target).expect("remove old target");
+        for _ in 0..MISSING_ROOT_RETIRE_TICKS {
+            retire_missing_registrations(&state, &tracker);
+        }
+        assert!(state.watch_registry().detached_probes().is_empty());
+        let mut admitted = Vec::new();
+        match timing {
+            Pr786OldJobTiming::Queued => {}
+            Pr786OldJobTiming::Admitted => {
+                admitted = state.watch_registry().take_pending_cleanups();
+                assert_eq!(admitted.len(), 1, "old job admitted before successor");
+            }
+        }
+
+        std::fs::create_dir(&target).expect("new target");
+        std::fs::write(&note, "# Note\n\npr786newindex\n").expect("new note");
+        std::fs::create_dir(&repo).expect("new repo");
+        std::fs::create_dir(repo.join(".git")).expect("new git");
+        std::fs::create_dir(repo.join(".hallouminate")).expect("new config dir");
+        symlink(&target, repo.join("alias")).expect("new alias");
+        std::fs::write(&config_path, config).expect("new config");
+        let (effective, _) =
+            hallouminate_config::resolve_for_cwd(&cfg, &repo, None).expect("resolve successor");
+        register_runtime_corpora(&state, Some(&config_path), &effective.corpora, &effective)
+            .expect("register successor");
+        assert_eq!(state.watch_registry().snapshot_roots()[0].0.corpus_key, key);
+        let result = crate::dispatch::dispatch(&state, request()).await;
+        let DaemonResponse::Ok { .. } = result else {
+            panic!("successor index must succeed: {result:?}");
+        };
+        let query = corpus("alias", target.to_str().expect("utf8"), &["**/*.md"]);
+        assert!(pr_786_followup_index_contains(&state, &query, "pr786newindex", &note).await);
+        std::fs::remove_dir_all(&repo).expect("remove successor repo");
+        std::fs::remove_dir_all(&target).expect("remove successor target");
+        for _ in 0..2 {
+            retire_missing_registrations(&state, &tracker);
+        }
+        assert_eq!(
+            state.watch_registry().snapshot_roots().len(),
+            1,
+            "successor is not retired"
+        );
+        match timing {
+            Pr786OldJobTiming::Queued => {
+                admitted = state.watch_registry().take_pending_cleanups();
+            }
+            Pr786OldJobTiming::Admitted => {}
+        }
+        for job in admitted {
+            spawn_retired_cleanup(&state, &tracker, job);
+        }
+        tracker.close();
+        tracker.wait().await;
+        assert_eq!(
+            store.list_files(&key).await.expect("successor files").len(),
+            1
+        );
+        assert!(
+            store
+                .corpus_chunk_stats(&key)
+                .await
+                .expect("successor chunks")
+                .total_chunks
+                > 0
+        );
+        assert!(
+            pr_786_followup_index_contains(&state, &query, "pr786newindex", &note).await,
+            "old cleanup must not delete exact successor rows before its own third observation"
+        );
+    }
+
+    #[cfg(unix)]
+    async fn pr_786_partial_successor_survives_old_group_cleanup(timing: Pr786OldJobTiming) {
+        use crate::ipc::{DaemonRequest, DaemonRequestPayload, DaemonResponse, IndexRequest};
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().canonicalize().expect("canonical tempdir");
+        let external = base.join("external");
+        let a = external.join("a");
+        let b = external.join("b");
+        let a_held = external.join("a-held");
+        let b_held = external.join("b-held");
+        let repo = base.join("repo");
+        for path in [&external, &a, &b, &repo] {
+            std::fs::create_dir(path).expect("fixture directory");
+        }
+        std::fs::create_dir(repo.join(".git")).expect("git boundary");
+        std::fs::create_dir(repo.join(".hallouminate")).expect("config dir");
+        symlink(&external, repo.join("external")).expect("external alias");
+        let config_path = repo.join(".hallouminate/config.toml");
+        let old_config = "[[corpus]]\nname = \"pair\"\npaths = [\"external/a\", \"external/b\"]\nglobs = [\"**/*.md\"]\n";
+        let successor_name = match timing {
+            Pr786OldJobTiming::Queued => "pair",
+            Pr786OldJobTiming::Admitted => "replacement",
+        };
+        let new_config = format!(
+            "[[corpus]]\nname = \"{successor_name}\"\npaths = [\"external/a\"]\nglobs = [\"**/*.md\"]\n"
+        );
+        std::fs::write(&config_path, old_config).expect("old config");
+        let a_note = a.join("a.md");
+        let b_note = b.join("b.md");
+        std::fs::write(&a_note, "# A\n\npr786partialold\n").expect("old a note");
+        std::fs::write(&b_note, "# B\n\npr786partialb\n").expect("b note");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.daemon.maintenance_interval_secs = 0;
+        cfg.security.allow_repo_paths_outside_root = vec![external.display().to_string()];
+        cfg.storage.ground_dir = base.join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg.clone(), None).await.expect("open");
+        let index = |name: &str| DaemonRequest {
+            cwd: repo.clone(),
+            payload: DaemonRequestPayload::Index(IndexRequest {
+                corpus: Some(name.into()),
+                paths_from: None,
+                strict: false,
+                background: false,
+            }),
+        };
+        let result = crate::dispatch::dispatch(&state, index("pair")).await;
+        let DaemonResponse::Ok { .. } = result else {
+            panic!("old index must succeed: {result:?}");
+        };
+        let (effective, _) =
+            hallouminate_config::resolve_for_cwd(&cfg, &repo, None).expect("resolve old repo");
+        register_runtime_corpora(&state, Some(&config_path), &effective.corpora, &effective)
+            .expect("register old pair");
+        let store = state
+            .resources_for(&effective)
+            .await
+            .expect("resources")
+            .store
+            .clone();
+        let old_a_key = corpus("pair", a.to_str().expect("utf8"), &["**/*.md"])
+            .corpus_keys()
+            .remove(0);
+        let b_key = corpus("pair", b.to_str().expect("utf8"), &["**/*.md"])
+            .corpus_keys()
+            .remove(0);
+        assert_eq!(
+            store
+                .list_files(&old_a_key)
+                .await
+                .expect("old a files")
+                .len(),
+            1
+        );
+        assert_eq!(
+            store.list_files(&b_key).await.expect("old b files").len(),
+            1
+        );
+
+        let tracker = TaskTracker::new();
+        std::fs::remove_dir_all(&repo).expect("remove old checkout");
+        for _ in 0..MISSING_ROOT_RETIRE_TICKS {
+            retire_missing_registrations(&state, &tracker);
+        }
+        assert_eq!(state.watch_registry().detached_probes().len(), 1);
+        std::fs::rename(&a, &a_held).expect("hold a bytes");
+        std::fs::rename(&b, &b_held).expect("hold b bytes");
+        for _ in 0..MISSING_ROOT_RETIRE_TICKS {
+            retire_missing_registrations(&state, &tracker);
+        }
+        assert!(state.watch_registry().detached_probes().is_empty());
+        std::fs::rename(&a_held, &a).expect("restore a bytes");
+        std::fs::rename(&b_held, &b).expect("restore b bytes");
+        let jobs = state.watch_registry().take_pending_cleanups();
+        assert_eq!(jobs.len(), 1, "both absent roots queue one old group");
+        for job in jobs {
+            spawn_retired_cleanup(&state, &tracker, job);
+        }
+        tracker.close();
+        tracker.wait().await;
+        let detached = state.watch_registry().detached_probes();
+        assert_eq!(detached.len(), 1, "returned old roots rearm");
+        assert_eq!(detached[0].1.len(), 2, "both old roots rearm");
+        let tracker = TaskTracker::new();
+        let mut admitted = Vec::new();
+        std::fs::rename(&a, &a_held).expect("hide rearmed a");
+        for _ in 0..MISSING_ROOT_RETIRE_TICKS {
+            retire_missing_registrations(&state, &tracker);
+        }
+        match timing {
+            Pr786OldJobTiming::Queued => {}
+            Pr786OldJobTiming::Admitted => {
+                admitted = state.watch_registry().take_pending_cleanups();
+                assert_eq!(admitted.len(), 1, "old a job admitted before partial owner");
+                assert_eq!(admitted[0].roots, vec![a.clone()]);
+            }
+        }
+        std::fs::rename(&a_held, &a).expect("restore old a bytes");
+        std::fs::create_dir(&repo).expect("restore same checkout");
+        std::fs::create_dir(repo.join(".git")).expect("restore git boundary");
+        std::fs::create_dir(repo.join(".hallouminate")).expect("restore config dir");
+        symlink(&external, repo.join("external")).expect("restore alias");
+        std::fs::write(&config_path, &new_config).expect("partial config");
+        reload_repo_layer(
+            &state,
+            &config_path,
+            &tracker,
+            &mut ReloadFailureMemo::new(),
+        );
+        let (effective, _) =
+            hallouminate_config::resolve_for_cwd(&cfg, &repo, None).expect("resolve partial repo");
+        assert_eq!(effective.corpora.len(), 1);
+        assert_eq!(effective.corpora[0].paths.len(), 1);
+        let roots = watch_roots_for(&effective.corpora[0]);
+        assert!(state.watch_registry().is_registered_unchanged(
+            &registry::ConfigSource::RepoLayer(config_path.clone()),
+            &effective.corpora[0],
+            &std::sync::Arc::new(effective.clone()),
+            &roots,
+        ));
+        std::fs::write(&a_note, "# A\n\npr786partialnew\n").expect("new a marker");
+        let result = crate::dispatch::dispatch(&state, index(successor_name)).await;
+        let DaemonResponse::Ok { .. } = result else {
+            panic!("partial index must succeed: {result:?}");
+        };
+        let query = corpus(successor_name, a.to_str().expect("utf8"), &["**/*.md"]);
+        let a_key = query.corpus_keys().remove(0);
+        assert_eq!(
+            store.list_files(&a_key).await.expect("new a files").len(),
+            1
+        );
+        assert!(
+            store
+                .corpus_chunk_stats(&a_key)
+                .await
+                .expect("new a chunks")
+                .total_chunks
+                > 0
+        );
+        assert!(pr_786_followup_index_contains(&state, &query, "pr786partialnew", &a_note).await);
+
+        std::fs::rename(&a, &a_held).expect("hide a without deleting bytes");
+        for _ in 0..MISSING_ROOT_RETIRE_TICKS - 1 {
+            retire_missing_registrations(&state, &tracker);
+        }
+        assert_eq!(
+            state.watch_registry().snapshot_roots().len(),
+            1,
+            "partial successor has only two missing observations",
+        );
+        match timing {
+            Pr786OldJobTiming::Queued => {
+                admitted = state.watch_registry().take_pending_cleanups();
+                assert_eq!(admitted.len(), 1, "old a job stayed queued across reload");
+                assert_eq!(admitted[0].roots, vec![a.clone()]);
+            }
+            Pr786OldJobTiming::Admitted => {}
+        }
+        for job in admitted {
+            spawn_retired_cleanup(&state, &tracker, job);
+        }
+        tracker.close();
+        tracker.wait().await;
+        assert_eq!(
+            store
+                .list_files(&a_key)
+                .await
+                .expect("protected a file map")
+                .len(),
+            1,
+            "old group cannot delete the partial successor's canonical a file map"
+        );
+        assert!(
+            store
+                .corpus_chunk_stats(&a_key)
+                .await
+                .expect("protected a chunks")
+                .total_chunks
+                > 0
+        );
+        assert!(
+            pr_786_followup_index_contains(&state, &query, "pr786partialnew", &a_note).await,
+            "old group cannot erase production-visible partial successor content"
+        );
+        assert_eq!(
+            store
+                .list_files(&b_key)
+                .await
+                .expect("live b file map")
+                .len(),
+            1
+        );
+        assert!(
+            pr_786_followup_index_contains(
+                &state,
+                &corpus("pair", b.to_str().expect("utf8"), &["**/*.md"]),
+                "pr786partialb",
+                &b_note,
+            )
+            .await
+        );
+        assert_eq!(
+            std::fs::read_to_string(a_held.join("a.md")).expect("a bytes"),
+            "# A\n\npr786partialnew\n"
+        );
+        std::fs::rename(&b, &b_held).expect("hide unowned b bytes");
+        let tracker = TaskTracker::new();
+        for _ in 0..MISSING_ROOT_RETIRE_TICKS - 1 {
+            retire_missing_registrations(&state, &tracker);
+            assert_eq!(
+                store
+                    .list_files(&b_key)
+                    .await
+                    .expect("b rows before own threshold")
+                    .len(),
+                1
+            );
+        }
+        retire_missing_registrations(&state, &tracker);
+        let jobs = state.watch_registry().take_pending_cleanups();
+        let mut b_job_found = false;
+        for job in &jobs {
+            if job.roots.contains(&b) {
+                b_job_found = true;
+            }
+        }
+        assert!(b_job_found, "unowned b queues after its own third miss");
+        for job in jobs {
+            spawn_retired_cleanup(&state, &tracker, job);
+        }
+        tracker.close();
+        tracker.wait().await;
+        assert_eq!(
+            store
+                .list_files(&b_key)
+                .await
+                .expect("retired b file map")
+                .len(),
+            0
+        );
+        assert!(
+            !pr_786_followup_index_contains(
+                &state,
+                &corpus("pair", b.to_str().expect("utf8"), &["**/*.md"]),
+                "pr786partialb",
+                &b_note,
+            )
+            .await
+        );
+        assert_eq!(
+            std::fs::read_to_string(b_held.join("b.md")).expect("b bytes"),
+            "# B\n\npr786partialb\n"
+        );
+
+        std::fs::remove_dir_all(&repo).expect("retire partial owner");
+        let tracker = TaskTracker::new();
+        for _ in 0..MISSING_ROOT_RETIRE_TICKS {
+            retire_missing_registrations(&state, &tracker);
+        }
+        tracker.close();
+        tracker.wait().await;
+        assert_eq!(
+            store
+                .list_files(&a_key)
+                .await
+                .expect("retired a file map")
+                .len(),
+            0
+        );
+        assert_eq!(
+            store
+                .list_files(&old_a_key)
+                .await
+                .expect("original a file map")
+                .len(),
+            0
+        );
+        assert_eq!(
+            std::fs::read_to_string(a_held.join("a.md")).expect("a bytes after retirement"),
+            "# A\n\npr786partialnew\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pr_786_queued_partial_successor_preserves_canonical_a_rows() {
+        pr_786_partial_successor_survives_old_group_cleanup(Pr786OldJobTiming::Queued).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pr_786_admitted_partial_successor_other_corpus_preserves_canonical_a_rows() {
+        pr_786_partial_successor_survives_old_group_cleanup(Pr786OldJobTiming::Admitted).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pr_786_queued_old_cleanup_preserves_exact_successor_rows() {
+        pr_786_exact_successor_survives_old_cleanup(Pr786OldJobTiming::Queued).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pr_786_admitted_old_cleanup_preserves_exact_successor_rows() {
+        pr_786_exact_successor_survives_old_cleanup(Pr786OldJobTiming::Admitted).await;
     }
 }

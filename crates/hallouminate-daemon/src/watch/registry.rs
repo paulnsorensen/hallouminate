@@ -19,16 +19,17 @@
 //! callers choose to make.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
-use std::sync::atomic::Ordering;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use hallouminate_config::Config;
 use hallouminate_domain::common::{CorpusConfig, CorpusKey};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::state::corpus_lock_keys;
 
-use super::WatchRoot;
+use super::{RootResolution, WatchRoot};
 
 /// Who asked for a corpus to be watched. Distinguishes the boot baseline
 /// (seeded once at watcher startup) from a later runtime discovery rooted at
@@ -91,6 +92,108 @@ fn registration_equivalent(
     existing.corpus == *corpus
         && existing.roots.as_slice() == roots
         && !cfg_binding_differs(&existing.cfg, cfg)
+}
+
+fn detached_matches(
+    detached: &DetachedRegistration,
+    id: &RegistrationId,
+    cfg: &Config,
+    roots: &[WatchRoot],
+) -> bool {
+    if detached.id.corpus_key != id.corpus_key
+        || cfg_binding_differs(&detached.cfg, cfg)
+        || detached.saved_roots.len() != roots.len()
+    {
+        return false;
+    }
+    let mut actual_roots = Vec::new();
+    for root in roots {
+        if root.resolution != RootResolution::Resolved {
+            return false;
+        }
+        actual_roots.push(
+            root.canonical_file_root
+                .as_ref()
+                .unwrap_or(&root.canonical_watched)
+                .clone(),
+        );
+    }
+    let mut saved_roots = detached.saved_roots.clone();
+    saved_roots.sort();
+    actual_roots.sort();
+    saved_roots == actual_roots
+}
+
+fn reclaim_matching_detached(
+    guard: &mut Inner,
+    pending: &Mutex<VecDeque<PendingCleanup>>,
+    id: &RegistrationId,
+    cfg: &Config,
+    roots: &[WatchRoot],
+) {
+    let matching = |detached: &DetachedRegistration| detached_matches(detached, id, cfg, roots);
+    let ticketed = match &id.source {
+        ConfigSource::RepoLayer(_) => guard
+            .detached
+            .iter()
+            .position(|detached| detached._ticket.is_some() && matching(detached)),
+        ConfigSource::Baseline => None,
+    };
+    if let Some(index) = ticketed.or_else(|| guard.detached.iter().position(matching)) {
+        let detached = guard.detached.remove(index);
+        detached.token.store(false, Ordering::SeqCst);
+        pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|item| match item {
+                PendingCleanup::Detached(token) => !Arc::ptr_eq(token, &detached.token),
+                PendingCleanup::Retired(registration) => !registration
+                    .ordinary_owner
+                    .as_ref()
+                    .is_some_and(|token| Arc::ptr_eq(token, &detached.token)),
+                PendingCleanup::Deferred(_) => true,
+            });
+    }
+}
+
+fn stabilize_unresolved_roots(guard: &Inner, corpus: &CorpusConfig, roots: &mut [WatchRoot]) {
+    for (index, root) in roots.iter_mut().enumerate() {
+        if root.resolution != RootResolution::Unresolved {
+            continue;
+        }
+        let mut prior: Option<&WatchRoot> = None;
+        let mut ambiguous = false;
+        for (id, registration) in &guard.regs {
+            if id.corpus_key.name != corpus.name || registration.corpus.paths != corpus.paths {
+                continue;
+            }
+            let Some(old) = registration.roots.get(index) else {
+                continue;
+            };
+            if old.resolution != RootResolution::Resolved {
+                continue;
+            }
+            if let Some(first) = prior
+                && (first.watched != old.watched
+                    || first.canonical_watched != old.canonical_watched
+                    || first.canonical_file_root != old.canonical_file_root
+                    || first.configured_file_root != old.configured_file_root
+                    || first.mode != old.mode)
+            {
+                ambiguous = true;
+                break;
+            }
+            prior = Some(old);
+        }
+        if !ambiguous && let Some(old) = prior {
+            root.watched = old.watched.clone();
+            root.canonical_watched = old.canonical_watched.clone();
+            root.canonical_file_root = old.canonical_file_root.clone();
+            root.configured_file_root = old.configured_file_root.clone();
+            root.resolution = old.resolution;
+            root.mode = old.mode;
+        }
+    }
 }
 
 /// Whether a candidate `(id, cfg, roots)` binding conflicts with an existing
@@ -204,6 +307,9 @@ struct Registration {
     lock_keys: Vec<CorpusKey>,
     cfg: Arc<Config>,
     roots: Vec<WatchRoot>,
+    binding: Arc<()>,
+    retirement_due: bool,
+    retirement_missing: bool,
     observation: Observation,
     pending: PendingWork,
     catch_up: CatchUpState,
@@ -218,6 +324,57 @@ struct Registration {
     /// clears it on the next reconcile tick, preventing a failing pass from
     /// busy-looping.
     retry_on_tick: bool,
+    /// Consecutive reconcile ticks that found this registration's root
+    /// absent; `record_absent_roots` resets it when the root reappears.
+    absent_ticks: u32,
+    checkout_absent_ticks: u32,
+    /// Consecutive identical reconcile failures `repeats_last_error` has
+    /// suppressed; resets at each reminder.
+    error_repeats: u32,
+}
+
+impl Registration {
+    fn saved_roots(&self, id: &RegistrationId) -> Vec<PathBuf> {
+        let mut roots = Vec::new();
+        for root in &self.roots {
+            match &root.canonical_file_root {
+                Some(file) => roots.push(file.clone()),
+                None => roots.push(root.canonical_watched.clone()),
+            }
+        }
+        if roots.is_empty() {
+            roots.push(id.corpus_key.canonical_root.clone());
+        }
+        roots
+    }
+}
+
+/// Identical reconcile failures between repeated `warn` reminders.
+const REPEAT_FAILURE_REMINDER_EVERY: u32 = 60;
+
+/// Cap on concurrent storage-cleanup attempts.
+const MAX_PENDING_CLEANUPS: usize = 64;
+
+#[derive(Debug)]
+pub(crate) struct RetirementTicket(Arc<AtomicUsize>);
+
+impl RetirementTicket {
+    fn new(counter: &Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self(Arc::clone(counter))
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RetirementCause {
+    ConfigRemoval,
+    MissingRoot,
+}
+
+impl Drop for RetirementTicket {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Result of a `register` call: whether this call created a new logical
@@ -232,10 +389,145 @@ pub(crate) enum RegisterOutcome {
 }
 
 /// Retired registration data needed for fail-closed storage cleanup.
-#[derive(Debug, Clone)]
+/// `roots` holds canonical storage keys, and `lock_keys` is the corpus-lock
+/// set cleanup takes before touching them.
+#[derive(Debug)]
 pub(crate) struct RetiredRegistration {
+    pub(crate) corpus: String,
     pub(crate) root: PathBuf,
+    pub(crate) roots: Vec<PathBuf>,
+    pub(crate) lock_keys: Vec<CorpusKey>,
     pub(crate) cfg: Arc<Config>,
+    pub(crate) failed_attempts: u32,
+    pub(crate) detached: Option<Arc<AtomicBool>>,
+    pub(crate) ordinary_owner: Option<Arc<AtomicBool>>,
+    pub(crate) log_missing_root: bool,
+    pub(crate) waiting_roots: Vec<PathBuf>,
+    pub(crate) _permit: Option<OwnedSemaphorePermit>,
+    pub(crate) _ticket: Option<RetirementTicket>,
+}
+
+impl RetiredRegistration {
+    /// Whether the current cleanup attempt should log at `warn`: the first
+    /// failure, then one reminder every `REPEAT_FAILURE_REMINDER_EVERY`.
+    pub(crate) fn warns_on_failure(&self) -> bool {
+        self.failed_attempts
+            .is_multiple_of(REPEAT_FAILURE_REMINDER_EVERY)
+    }
+
+    fn from_registration(
+        id: &RegistrationId,
+        registration: &Registration,
+        retired_count: &Arc<AtomicUsize>,
+        permit: OwnedSemaphorePermit,
+    ) -> Self {
+        Self::from_registration_with_permit(id, registration, retired_count, Some(permit))
+    }
+
+    fn from_registration_with_permit(
+        id: &RegistrationId,
+        registration: &Registration,
+        retired_count: &Arc<AtomicUsize>,
+        permit: Option<OwnedSemaphorePermit>,
+    ) -> Self {
+        let roots = registration.saved_roots(id);
+        Self {
+            corpus: id.corpus_key.name.clone(),
+            root: id.corpus_key.canonical_root.clone(),
+            roots,
+            lock_keys: registration.lock_keys.clone(),
+            cfg: registration.cfg.clone(),
+            failed_attempts: 0,
+            detached: None,
+            ordinary_owner: None,
+            log_missing_root: false,
+            waiting_roots: Vec::new(),
+            _permit: permit,
+            _ticket: match &id.source {
+                ConfigSource::Baseline => None,
+                ConfigSource::RepoLayer(_) => Some(RetirementTicket::new(retired_count)),
+            },
+        }
+    }
+}
+
+fn attach_ordinary_owner(
+    guard: &mut Inner,
+    id: &RegistrationId,
+    registration: &Registration,
+    retired: &mut RetiredRegistration,
+) {
+    let mut independent_dirs = HashSet::new();
+    for root in &registration.roots {
+        if root.resolution == RootResolution::Resolved && root.canonical_file_root.is_none() {
+            independent_dirs.insert(root.canonical_watched.clone());
+        }
+    }
+    let token = Arc::new(AtomicBool::new(true));
+    guard.detached.push(DetachedRegistration {
+        id: id.clone(),
+        cfg: registration.cfg.clone(),
+        saved_roots: retired.roots.clone(),
+        independent_dirs,
+        binding: registration.binding.clone(),
+        token: token.clone(),
+        _ticket: retired._ticket.take(),
+        retired: None,
+        waiting_roots: Vec::new(),
+        ready_roots: Vec::new(),
+        absent_ticks: 0,
+        rearmed_ticks: HashMap::new(),
+        queued: false,
+    });
+    retired.ordinary_owner = Some(token);
+    retired.log_missing_root = true;
+}
+
+struct DetachedRegistration {
+    id: RegistrationId,
+    cfg: Arc<Config>,
+    saved_roots: Vec<PathBuf>,
+    independent_dirs: HashSet<PathBuf>,
+    binding: Arc<()>,
+    token: Arc<AtomicBool>,
+    _ticket: Option<RetirementTicket>,
+    retired: Option<RetiredRegistration>,
+    waiting_roots: Vec<PathBuf>,
+    ready_roots: Vec<PathBuf>,
+    absent_ticks: u32,
+    rearmed_ticks: HashMap<PathBuf, u32>,
+    queued: bool,
+}
+
+enum PendingCleanup {
+    Retired(RetiredRegistration),
+    Detached(Arc<AtomicBool>),
+    Deferred(RegistrationId),
+}
+
+/// One registration's binding and corpus for an unlocked absence check.
+pub(crate) struct RootProbe {
+    pub(crate) id: RegistrationId,
+    pub(crate) corpus: CorpusConfig,
+    binding: Arc<()>,
+    pub(crate) saved_roots: Vec<PathBuf>,
+}
+
+pub(crate) struct DetachedRootObservation {
+    pub(crate) binding: Arc<()>,
+    pub(crate) absences: Vec<(PathBuf, bool)>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum RootPresence {
+    Absent,
+    CheckoutAbsent,
+    Present,
+}
+
+pub(crate) struct RootObservation {
+    pub(crate) probe: RootProbe,
+    pub(crate) presence: RootPresence,
 }
 
 /// One admitted catch-up: a leader plus every compatible registration that
@@ -257,6 +549,8 @@ struct Inner {
     regs: HashMap<RegistrationId, Registration>,
     queue: VecDeque<RegistrationId>,
     active: Vec<ActiveGroup>,
+    detached: Vec<DetachedRegistration>,
+    retry_sources: HashSet<PathBuf>,
     /// Bumped on every mutation that already notifies `changed`, plus every
     /// `refresh_roots` re-key. Lets the pump's per-iteration reconcile skip
     /// work when nothing in the registry moved since its last pass.
@@ -279,6 +573,10 @@ pub(crate) struct WatchRegistry {
     /// Set while the boot `catch_up_index` task runs. Baseline registrations
     /// start `Done`, so this is the only signal that their index may lag.
     boot_catch_up_running: std::sync::atomic::AtomicBool,
+    /// Retired registrations whose storage cleanup failed and must retry.
+    pending_cleanups: Mutex<VecDeque<PendingCleanup>>,
+    cleanup_slots: Arc<Semaphore>,
+    retired_runtime: Arc<AtomicUsize>,
 }
 
 /// Whether the boot catch-up sweep is still reconciling baseline corpora.
@@ -305,12 +603,17 @@ impl WatchRegistry {
                 regs: HashMap::new(),
                 queue: VecDeque::new(),
                 active: Vec::new(),
+                detached: Vec::new(),
+                retry_sources: HashSet::new(),
                 generation: 0,
             }),
             changed: tokio::sync::Notify::new(),
             settled: tokio::sync::Notify::new(),
             pump_unavailable: std::sync::atomic::AtomicBool::new(false),
             boot_catch_up_running: std::sync::atomic::AtomicBool::new(false),
+            pending_cleanups: Mutex::new(VecDeque::new()),
+            cleanup_slots: Arc::new(Semaphore::new(MAX_PENDING_CLEANUPS)),
+            retired_runtime: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -365,12 +668,18 @@ impl WatchRegistry {
                 corpus,
                 cfg,
                 roots,
+                binding: Arc::new(()),
+                retirement_due: false,
+                retirement_missing: false,
                 observation: Observation::Watched,
                 pending: PendingWork::Idle,
                 catch_up: CatchUpState::Done,
                 last_error: None,
                 reconciled_once: true,
                 retry_on_tick: false,
+                absent_ticks: 0,
+                checkout_absent_ticks: 0,
+                error_repeats: 0,
             },
         );
         guard.generation += 1;
@@ -387,27 +696,28 @@ impl WatchRegistry {
         source: ConfigSource,
         corpus: CorpusConfig,
         cfg: Arc<Config>,
-        roots: Vec<WatchRoot>,
+        mut roots: Vec<WatchRoot>,
     ) -> RegisterOutcome {
+        let mut guard = self.lock();
+        stabilize_unresolved_roots(&guard, &corpus, &mut roots);
         let id = RegistrationId {
             source,
             corpus_key: corpus_key(&corpus, &roots),
         };
-        let mut guard = self.lock();
         let obsolete: Vec<RegistrationId> = guard
             .regs
-            .keys()
-            .filter(|existing| {
+            .iter()
+            .filter(|(existing, reg)| {
                 existing.source == id.source
                     && existing.corpus_key.name == id.corpus_key.name
                     && existing.corpus_key != id.corpus_key
+                    && !reg.retirement_due
             })
-            .cloned()
+            .map(|(existing, _)| existing.clone())
             .collect();
-        let unchanged = guard
-            .regs
-            .get(&id)
-            .is_some_and(|existing| registration_equivalent(existing, &corpus, &cfg, &roots));
+        let unchanged = guard.regs.get(&id).is_some_and(|existing| {
+            !existing.retirement_due && registration_equivalent(existing, &corpus, &cfg, &roots)
+        });
         if unchanged {
             let existing = guard.regs.get_mut(&id).expect("checked above");
             existing.lock_keys = corpus_lock_keys(&corpus);
@@ -437,8 +747,14 @@ impl WatchRegistry {
             let replaces_runtime = guard.regs.contains_key(&id)
                 || obsolete
                     .iter()
-                    .any(|existing| matches!(existing.source, ConfigSource::RepoLayer(_)));
-            if runtime_count >= MAX_RUNTIME_REGISTRATIONS && !replaces_runtime {
+                    .any(|existing| matches!(existing.source, ConfigSource::RepoLayer(_)))
+                || guard.detached.iter().any(|detached| {
+                    detached._ticket.is_some() && detached_matches(detached, &id, &cfg, &roots)
+                });
+            if runtime_count + self.retired_runtime.load(Ordering::SeqCst)
+                >= MAX_RUNTIME_REGISTRATIONS
+                && !replaces_runtime
+            {
                 return RegisterOutcome::LimitReached;
             }
         }
@@ -451,6 +767,9 @@ impl WatchRegistry {
         // of the replaced registration. A changed re-registration keeps that
         // observation so the pump's per-id cache and the registry stay in
         // agreement; every other observation resets and the pump re-derives it.
+        if guard.regs.get(&id).is_some_and(|reg| reg.retirement_due) {
+            self.cancel_deferred(&id);
+        }
         let observation = match guard.regs.remove(&id).map(|reg| reg.observation) {
             Some(Observation::Degraded {
                 retrying: false,
@@ -463,6 +782,7 @@ impl WatchRegistry {
         };
         release_admission(&mut guard, &id);
         guard.queue.retain(|queued| queued != &id);
+        reclaim_matching_detached(&mut guard, &self.pending_cleanups, &id, &cfg, &roots);
         guard.regs.insert(
             id.clone(),
             Registration {
@@ -470,12 +790,18 @@ impl WatchRegistry {
                 corpus,
                 cfg,
                 roots,
+                binding: Arc::new(()),
+                retirement_due: false,
+                retirement_missing: false,
                 observation,
                 pending: PendingWork::Idle,
                 catch_up: CatchUpState::Queued,
                 last_error: None,
                 reconciled_once: false,
                 retry_on_tick: false,
+                absent_ticks: 0,
+                checkout_absent_ticks: 0,
+                error_repeats: 0,
             },
         );
         guard.queue.push_back(id);
@@ -496,10 +822,14 @@ impl WatchRegistry {
         cfg: &Config,
         roots: &[WatchRoot],
     ) -> bool {
-        self.lock().regs.iter().any(|(id, existing)| {
+        let guard = self.lock();
+        let mut roots = roots.to_vec();
+        stabilize_unresolved_roots(&guard, corpus, &mut roots);
+        guard.regs.iter().any(|(id, existing)| {
             id.source == *source
                 && id.corpus_key.name == corpus.name
-                && registration_equivalent(existing, corpus, cfg, roots)
+                && !existing.retirement_due
+                && registration_equivalent(existing, corpus, cfg, &roots)
         })
     }
 
@@ -530,64 +860,113 @@ impl WatchRegistry {
     where
         F: Fn(&CorpusConfig) -> Vec<WatchRoot>,
     {
-        let snapshot: Vec<(RegistrationId, CorpusConfig)> = {
+        let snapshot: Vec<(RegistrationId, CorpusConfig, Vec<WatchRoot>, Arc<()>)> = {
             let guard = self.lock();
             guard
                 .regs
                 .iter()
-                .map(|(id, registration)| (id.clone(), registration.corpus.clone()))
+                .filter(|(_, registration)| !registration.retirement_due)
+                .map(|(id, registration)| {
+                    (
+                        id.clone(),
+                        registration.corpus.clone(),
+                        registration.roots.clone(),
+                        Arc::clone(&registration.binding),
+                    )
+                })
                 .collect()
         };
-        let built: Vec<(RegistrationId, Vec<WatchRoot>)> = snapshot
-            .into_iter()
-            .map(|(id, corpus)| {
-                let roots = build(&corpus);
-                (id, roots)
-            })
-            .collect();
+        let mut built = Vec::new();
+        for (id, corpus, previous, binding) in snapshot {
+            let mut roots = build(&corpus);
+            let mut fully_resolved = true;
+            for root in &roots {
+                if root.resolution != RootResolution::Resolved {
+                    fully_resolved = false;
+                    break;
+                }
+            }
+            for (index, root) in roots.iter_mut().enumerate() {
+                if root.resolution == RootResolution::Unresolved
+                    && let Some(old) = previous.get(index)
+                {
+                    *root = old.clone();
+                }
+            }
+            built.push((id, roots, binding, fully_resolved));
+        }
 
         let mut guard = self.lock();
-        let stale: Vec<(RegistrationId, RegistrationId, Vec<WatchRoot>)> = built
-            .iter()
-            .filter_map(|(id, roots)| {
-                let registration = guard.regs.get(id)?;
-                let new_key = corpus_key(&registration.corpus, roots);
-                if new_key == id.corpus_key {
-                    return None;
-                }
-                Some((
-                    id.clone(),
-                    RegistrationId {
-                        source: id.source.clone(),
-                        corpus_key: new_key,
-                    },
-                    roots.clone(),
-                ))
-            })
-            .collect();
-        for (old_id, new_id, roots) in stale {
-            let Some(mut registration) = guard.regs.remove(&old_id) else {
+        for (old_id, roots, binding, fully_resolved) in built {
+            let Some(current) = guard.regs.get(&old_id) else {
                 continue;
             };
-            registration.roots = roots;
-            if registration.catch_up == CatchUpState::InFlight {
-                registration.catch_up = CatchUpState::Queued;
-                release_admission(&mut guard, &old_id);
-                guard.queue.push_back(new_id.clone());
+            if current.retirement_due || !Arc::ptr_eq(&current.binding, &binding) {
+                continue;
             }
-            guard.regs.insert(new_id.clone(), registration);
-            for queued in guard.queue.iter_mut() {
-                if *queued == old_id {
-                    *queued = new_id.clone();
+            if current.roots == roots {
+                if fully_resolved && !roots.is_empty() {
+                    let cfg = Arc::clone(&current.cfg);
+                    reclaim_matching_detached(
+                        &mut guard,
+                        &self.pending_cleanups,
+                        &old_id,
+                        &cfg,
+                        &roots,
+                    );
                 }
+                continue;
             }
-            guard.generation += 1;
-        }
-        for (id, roots) in &built {
-            if let Some(registration) = guard.regs.get_mut(id)
-                && registration.roots != *roots
-            {
-                registration.roots = roots.clone();
+            let new_key = corpus_key(&current.corpus, &roots);
+            if new_key != old_id.corpus_key {
+                let new_id = RegistrationId {
+                    source: old_id.source.clone(),
+                    corpus_key: new_key,
+                };
+                let Some(mut registration) = guard.regs.remove(&old_id) else {
+                    continue;
+                };
+                registration.roots = roots;
+                registration.binding = Arc::new(());
+                registration.absent_ticks = 0;
+                registration.checkout_absent_ticks = 0;
+                if registration.catch_up == CatchUpState::InFlight {
+                    registration.catch_up = CatchUpState::Queued;
+                    release_admission(&mut guard, &old_id);
+                    guard.queue.push_back(new_id.clone());
+                }
+                if fully_resolved && !registration.roots.is_empty() {
+                    reclaim_matching_detached(
+                        &mut guard,
+                        &self.pending_cleanups,
+                        &new_id,
+                        &registration.cfg,
+                        &registration.roots,
+                    );
+                }
+                guard.regs.insert(new_id.clone(), registration);
+                for queued in &mut guard.queue {
+                    if *queued == old_id {
+                        *queued = new_id.clone();
+                    }
+                }
+                guard.generation += 1;
+            } else if let Some(registration) = guard.regs.get_mut(&old_id) {
+                registration.roots = roots;
+                registration.binding = Arc::new(());
+                registration.absent_ticks = 0;
+                registration.checkout_absent_ticks = 0;
+                if fully_resolved && !registration.roots.is_empty() {
+                    let cfg = Arc::clone(&registration.cfg);
+                    let roots = registration.roots.clone();
+                    reclaim_matching_detached(
+                        &mut guard,
+                        &self.pending_cleanups,
+                        &old_id,
+                        &cfg,
+                        &roots,
+                    );
+                }
             }
         }
     }
@@ -599,7 +978,7 @@ impl WatchRegistry {
         self.lock()
             .regs
             .iter()
-            .filter(|(_, reg)| reg.roots.iter().any(|owned| owned == root))
+            .filter(|(_, reg)| !reg.retirement_due && reg.roots.iter().any(|owned| owned == root))
             .map(|(id, _)| id.clone())
             .collect()
     }
@@ -611,6 +990,7 @@ impl WatchRegistry {
             .lock()
             .regs
             .iter()
+            .filter(|(_, reg)| !reg.retirement_due)
             .flat_map(|(id, reg)| reg.roots.iter().map(move |root| (id.clone(), root.clone())))
             .collect();
         roots.sort_by(|(left, _), (right, _)| {
@@ -634,51 +1014,128 @@ impl WatchRegistry {
         cfg: Arc<Config>,
         build_roots: impl Fn(&CorpusConfig) -> Vec<WatchRoot>,
     ) -> Result<Vec<RetiredRegistration>, String> {
-        let candidates: Vec<_> = corpora
+        let built: Vec<_> = corpora
             .into_iter()
             .map(|corpus| {
                 let roots = build_roots(&corpus);
-                let id = RegistrationId {
-                    source: source.clone(),
-                    corpus_key: corpus_key(&corpus, &roots),
-                };
-                (id, corpus, roots)
+                (corpus, roots)
             })
             .collect();
         let mut guard = self.lock();
+        let mut candidates = Vec::new();
+        for (corpus, mut roots) in built {
+            stabilize_unresolved_roots(&guard, &corpus, &mut roots);
+            let id = RegistrationId {
+                source: source.clone(),
+                corpus_key: corpus_key(&corpus, &roots),
+            };
+            candidates.push((id, corpus, roots));
+        }
         for (id, _, roots) in &candidates {
             if let Some(message) = binding_conflict(&guard, id, &cfg, roots) {
                 return Err(message);
             }
         }
         let candidate_ids: HashSet<_> = candidates.iter().map(|(id, ..)| id.clone()).collect();
+        let over_limit = match &source {
+            ConfigSource::Baseline => false,
+            ConfigSource::RepoLayer(_) => {
+                let live = guard
+                    .regs
+                    .keys()
+                    .filter(|id| matches!(id.source, ConfigSource::RepoLayer(_)))
+                    .count();
+                let mut added = 0;
+                let mut reusable = HashSet::new();
+                let mut seen = HashSet::new();
+                for (id, _, roots) in &candidates {
+                    if !seen.insert(id.clone()) || guard.regs.contains_key(id) {
+                        continue;
+                    }
+                    added += 1;
+                    for (index, detached) in guard.detached.iter().enumerate() {
+                        if !reusable.contains(&index)
+                            && detached._ticket.is_some()
+                            && detached_matches(detached, id, &cfg, roots)
+                        {
+                            reusable.insert(index);
+                            break;
+                        }
+                    }
+                }
+                live + self.retired_runtime.load(Ordering::SeqCst) + added - reusable.len()
+                    > MAX_RUNTIME_REGISTRATIONS
+            }
+        };
         let removed: HashSet<_> = guard
             .regs
             .keys()
             .filter(|id| id.source == source && !candidate_ids.contains(*id))
             .cloned()
             .collect();
-        let retired = removed
-            .iter()
-            .filter_map(|id| {
-                guard.regs.get(id).map(|registration| RetiredRegistration {
-                    root: id.corpus_key.canonical_root.clone(),
-                    cfg: registration.cfg.clone(),
-                })
-            })
-            .collect();
-        for id in &removed {
-            guard.regs.remove(id);
-            release_admission(&mut guard, id);
+        let mut retired = Vec::new();
+        if over_limit {
+            let mut pending = self
+                .pending_cleanups
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for id in &removed {
+                if let Some(registration) = guard.regs.get_mut(id) {
+                    registration.retirement_missing = false;
+                    if !registration.retirement_due {
+                        registration.retirement_due = true;
+                        release_admission(&mut guard, id);
+                        pending.push_back(PendingCleanup::Deferred(id.clone()));
+                    }
+                }
+            }
+            guard.queue.retain(|id| !removed.contains(id));
+            if let ConfigSource::RepoLayer(path) = &source
+                && guard.retry_sources.len() < MAX_RUNTIME_REGISTRATIONS
+            {
+                guard.retry_sources.insert(path.clone());
+            }
+        } else {
+            for id in &removed {
+                if let Some(cleanup) =
+                    self.retire_or_defer(&mut guard, id, RetirementCause::ConfigRemoval)
+                {
+                    retired.push(cleanup);
+                }
+            }
+            guard.queue.retain(|id| !removed.contains(id));
+            if let ConfigSource::RepoLayer(path) = &source {
+                guard.retry_sources.remove(path);
+            }
         }
-        guard.queue.retain(|id| !removed.contains(id));
         for (id, corpus, roots) in candidates {
+            if over_limit
+                && !guard.regs.contains_key(&id)
+                && !guard.detached.iter().any(|detached| {
+                    detached._ticket.is_some() && detached_matches(detached, &id, &cfg, &roots)
+                })
+            {
+                continue;
+            }
+            if guard
+                .regs
+                .get(&id)
+                .is_some_and(|existing| existing.retirement_due)
+            {
+                self.cancel_deferred(&id);
+            }
             if let Some(existing) = guard.regs.get_mut(&id)
                 && registration_equivalent(existing, &corpus, &cfg, &roots)
             {
                 existing.lock_keys = corpus_lock_keys(&corpus);
                 existing.corpus = corpus;
                 existing.cfg = cfg.clone();
+                if existing.retirement_due {
+                    existing.retirement_due = false;
+                    existing.retirement_missing = false;
+                    existing.catch_up = CatchUpState::Queued;
+                    guard.queue.push_back(id);
+                }
                 continue;
             }
             if guard
@@ -689,6 +1146,7 @@ impl WatchRegistry {
                 release_admission(&mut guard, &id);
             }
             guard.queue.retain(|queued| queued != &id);
+            reclaim_matching_detached(&mut guard, &self.pending_cleanups, &id, &cfg, &roots);
             guard.regs.insert(
                 id.clone(),
                 Registration {
@@ -696,12 +1154,18 @@ impl WatchRegistry {
                     corpus,
                     cfg: cfg.clone(),
                     roots,
+                    binding: Arc::new(()),
+                    retirement_due: false,
+                    retirement_missing: false,
                     observation: Observation::Watched,
                     pending: PendingWork::Idle,
                     catch_up: CatchUpState::Queued,
                     last_error: None,
                     reconciled_once: false,
                     retry_on_tick: false,
+                    absent_ticks: 0,
+                    checkout_absent_ticks: 0,
+                    error_repeats: 0,
                 },
             );
             guard.queue.push_back(id);
@@ -710,20 +1174,32 @@ impl WatchRegistry {
         drop(guard);
         self.signal_changed();
         self.settled.notify_waiters();
-        Ok(retired)
+        if over_limit {
+            Err("runtime watcher registration limit reached; retaining source for retry".into())
+        } else {
+            Ok(retired)
+        }
     }
 
     pub(crate) fn repo_layer_sources(&self) -> Vec<PathBuf> {
-        let paths: std::collections::BTreeSet<PathBuf> = self
-            .lock()
-            .regs
-            .keys()
-            .filter_map(|id| match &id.source {
-                ConfigSource::RepoLayer(path) => Some(path.clone()),
-                ConfigSource::Baseline => None,
-            })
-            .collect();
+        let guard = self.lock();
+        let mut paths: std::collections::BTreeSet<PathBuf> =
+            guard.retry_sources.iter().cloned().collect();
+        for id in guard.regs.keys() {
+            if let ConfigSource::RepoLayer(path) = &id.source {
+                paths.insert(path.clone());
+            }
+        }
+        for detached in &guard.detached {
+            if let ConfigSource::RepoLayer(path) = &detached.id.source {
+                paths.insert(path.clone());
+            }
+        }
         paths.into_iter().collect()
+    }
+
+    pub(crate) fn forget_retry_source(&self, path: &Path) {
+        self.lock().retry_sources.remove(path);
     }
     /// Record paths as pending work for a registration's durable ledger,
     /// distinct from `watch/mod.rs`'s transient per-batch buffer, and queue
@@ -734,7 +1210,9 @@ impl WatchRegistry {
         paths: impl IntoIterator<Item = PathBuf>,
     ) {
         let mut guard = self.lock();
-        if let Some(reg) = guard.regs.get_mut(id) {
+        if let Some(reg) = guard.regs.get_mut(id)
+            && !reg.retirement_due
+        {
             reg.pending.add_paths(paths);
         }
         Self::mark_dirty_locked(&mut guard, id);
@@ -782,6 +1260,482 @@ impl WatchRegistry {
             .regs
             .get(id)
             .is_some_and(|reg| reg.last_error.is_some())
+    }
+
+    /// Whether `error` equals the error that `id`'s previous catch-up pass
+    /// recorded, so the caller can log a repeated failure below `warn`.
+    pub(crate) fn repeats_last_error(&self, id: &RegistrationId, error: &str) -> bool {
+        let mut guard = self.lock();
+        let Some(reg) = guard.regs.get_mut(id) else {
+            return false;
+        };
+        if reg.last_error.as_deref() != Some(error) {
+            reg.error_repeats = 0;
+            return false;
+        }
+        reg.error_repeats = reg.error_repeats.saturating_add(1);
+        if reg.error_repeats >= REPEAT_FAILURE_REMINDER_EVERY {
+            reg.error_repeats = 0;
+            return false;
+        }
+        true
+    }
+
+    fn cancel_deferred(&self, id: &RegistrationId) {
+        self.pending_cleanups
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|item| match item {
+                PendingCleanup::Deferred(queued) => queued != id,
+                PendingCleanup::Retired(_) | PendingCleanup::Detached(_) => true,
+            });
+    }
+
+    fn retire_or_defer(
+        &self,
+        guard: &mut Inner,
+        id: &RegistrationId,
+        cause: RetirementCause,
+    ) -> Option<RetiredRegistration> {
+        let mut pending = self
+            .pending_cleanups
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if pending.is_empty()
+            && let Ok(permit) = self.cleanup_slots.clone().try_acquire_owned()
+        {
+            let registration = guard.regs.remove(id)?;
+            release_admission(guard, id);
+            let mut retired = RetiredRegistration::from_registration(
+                id,
+                &registration,
+                &self.retired_runtime,
+                permit,
+            );
+            if cause == RetirementCause::MissingRoot {
+                attach_ordinary_owner(guard, id, &registration, &mut retired);
+            }
+            return Some(retired);
+        }
+        if let Some(registration) = guard.regs.get_mut(id) {
+            registration.retirement_missing = cause == RetirementCause::MissingRoot;
+            if !registration.retirement_due {
+                registration.retirement_due = true;
+                release_admission(guard, id);
+                pending.push_back(PendingCleanup::Deferred(id.clone()));
+            }
+        }
+        None
+    }
+
+    /// Returns failed cleanup to the FIFO without retaining an execution permit.
+    pub(crate) fn park_failed_cleanup(&self, mut registration: RetiredRegistration) {
+        registration._permit = None;
+        let Some(token) = registration
+            .detached
+            .as_ref()
+            .or(registration.ordinary_owner.as_ref())
+            .cloned()
+        else {
+            self.pending_cleanups
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push_back(PendingCleanup::Retired(registration));
+            return;
+        };
+        let mut guard = self.lock();
+        let Some(index) = guard
+            .detached
+            .iter()
+            .position(|detached| Arc::ptr_eq(&detached.token, &token))
+        else {
+            return;
+        };
+        let detached = &mut guard.detached[index];
+        if !registration.waiting_roots.is_empty() {
+            for root in &registration.waiting_roots {
+                if detached.independent_dirs.contains(root) {
+                    detached.rearmed_ticks.insert(root.clone(), 0);
+                }
+            }
+            detached
+                .waiting_roots
+                .append(&mut registration.waiting_roots);
+            detached.absent_ticks = 0;
+            detached.binding = Arc::new(());
+        }
+        registration.roots.append(&mut detached.ready_roots);
+        if !registration.roots.is_empty() {
+            detached.queued = true;
+            self.pending_cleanups
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push_back(PendingCleanup::Detached(token));
+        }
+        let finished = detached.waiting_roots.is_empty() && registration.roots.is_empty();
+        if finished {
+            guard.detached.remove(index);
+        } else {
+            detached.retired = Some(registration);
+        }
+    }
+
+    /// Admits retries and deferred retirements in FIFO order, up to the task cap.
+    pub(crate) fn take_pending_cleanups(&self) -> Vec<RetiredRegistration> {
+        let mut guard = self.lock();
+        let mut pending = self
+            .pending_cleanups
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut admitted = Vec::new();
+        let mut removed = HashSet::new();
+        while let Some(item) = pending.pop_front() {
+            let Ok(permit) = self.cleanup_slots.clone().try_acquire_owned() else {
+                pending.push_front(item);
+                break;
+            };
+            match item {
+                PendingCleanup::Retired(mut registration) => {
+                    registration._permit = Some(permit);
+                    admitted.push(registration);
+                }
+                PendingCleanup::Detached(token) => {
+                    let Some(detached) = guard
+                        .detached
+                        .iter_mut()
+                        .find(|detached| Arc::ptr_eq(&detached.token, &token))
+                    else {
+                        continue;
+                    };
+                    detached.queued = false;
+                    let Some(mut registration) = detached.retired.take() else {
+                        continue;
+                    };
+                    registration._permit = Some(permit);
+                    admitted.push(registration);
+                }
+                PendingCleanup::Deferred(id) => {
+                    let Some(registration) = guard.regs.get(&id) else {
+                        continue;
+                    };
+                    if !registration.retirement_due {
+                        continue;
+                    }
+                    let registration = guard.regs.remove(&id).expect("checked above");
+                    release_admission(&mut guard, &id);
+                    let mut retired = RetiredRegistration::from_registration(
+                        &id,
+                        &registration,
+                        &self.retired_runtime,
+                        permit,
+                    );
+                    if registration.retirement_missing {
+                        attach_ordinary_owner(&mut guard, &id, &registration, &mut retired);
+                    }
+                    admitted.push(retired);
+                    removed.insert(id);
+                }
+            }
+        }
+        if !removed.is_empty() {
+            guard.queue.retain(|id| !removed.contains(id));
+            guard.generation += 1;
+        }
+        drop(pending);
+        drop(guard);
+        if !removed.is_empty() {
+            self.signal_changed();
+            self.settled.notify_waiters();
+        }
+        admitted
+    }
+
+    /// Copies each registration's binding and corpus for an unlocked probe.
+    /// The caller expands declared paths after releasing the registry lock.
+    pub(crate) fn root_probes(&self) -> Vec<RootProbe> {
+        let guard = self.lock();
+        let mut probes = Vec::new();
+        for (id, reg) in &guard.regs {
+            if reg.retirement_due && !reg.retirement_missing {
+                continue;
+            }
+            probes.push(RootProbe {
+                id: id.clone(),
+                corpus: reg.corpus.clone(),
+                saved_roots: reg.saved_roots(id),
+                binding: reg.binding.clone(),
+            });
+        }
+        probes
+    }
+
+    /// Whether a live registration owns this exact physical root in the same store.
+    pub(crate) fn live_claims_retired_root(&self, cfg: &Config, root: &Path) -> bool {
+        let guard = self.lock();
+        for (id, registration) in &guard.regs {
+            if registration.cfg.storage.ground_dir != cfg.storage.ground_dir {
+                continue;
+            }
+            for saved in registration.saved_roots(id) {
+                if saved == root {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    #[cfg(test)]
+    pub(super) fn retired_runtime_count(&self) -> usize {
+        self.retired_runtime.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn detached_probes(&self) -> Vec<(Arc<()>, Vec<PathBuf>)> {
+        let guard = self.lock();
+        let mut probes = Vec::new();
+        for detached in &guard.detached {
+            if !detached.waiting_roots.is_empty() {
+                probes.push((detached.binding.clone(), detached.waiting_roots.clone()));
+            }
+        }
+        probes
+    }
+
+    pub(crate) fn record_detached_absence(
+        &self,
+        observations: &[DetachedRootObservation],
+        threshold: u32,
+    ) {
+        let mut guard = self.lock();
+        let mut ready = Vec::new();
+        let mut claims = HashSet::new();
+        for (id, registration) in &guard.regs {
+            for root in registration.saved_roots(id) {
+                claims.insert((registration.cfg.storage.ground_dir.clone(), root));
+            }
+        }
+        for detached in &mut guard.detached {
+            let Some(DetachedRootObservation { absences, .. }) = observations
+                .iter()
+                .find(|observation| Arc::ptr_eq(&observation.binding, &detached.binding))
+            else {
+                continue;
+            };
+            let mut eligible = Vec::new();
+            if detached.rearmed_ticks.is_empty() {
+                let absent = detached.waiting_roots.iter().all(|root| {
+                    absences
+                        .iter()
+                        .any(|(path, absent)| path == root && *absent)
+                });
+                if absent {
+                    detached.absent_ticks = detached.absent_ticks.saturating_add(1);
+                } else {
+                    detached.absent_ticks = 0;
+                }
+                if detached.absent_ticks >= threshold {
+                    detached.absent_ticks = 0;
+                    eligible.append(&mut detached.waiting_roots);
+                }
+            } else {
+                for (root, ticks) in &mut detached.rearmed_ticks {
+                    let absent = !claims
+                        .contains(&(detached.cfg.storage.ground_dir.clone(), root.clone()))
+                        && absences
+                            .iter()
+                            .find(|(path, _)| path == root)
+                            .is_some_and(|(_, absent)| *absent);
+                    if absent {
+                        *ticks = ticks.saturating_add(1);
+                    } else {
+                        *ticks = 0;
+                    }
+                }
+                let all_absent = detached.waiting_roots.iter().all(|root| {
+                    absences
+                        .iter()
+                        .any(|(path, absent)| path == root && *absent)
+                });
+                if all_absent {
+                    detached.absent_ticks = detached.absent_ticks.saturating_add(1);
+                } else {
+                    detached.absent_ticks = 0;
+                }
+                let group_ready = detached.absent_ticks >= threshold;
+                if group_ready {
+                    detached.absent_ticks = 0;
+                }
+                detached.waiting_roots.retain(|root| {
+                    let ready = if detached.independent_dirs.contains(root) {
+                        detached
+                            .rearmed_ticks
+                            .get(root)
+                            .is_some_and(|ticks| *ticks >= threshold)
+                    } else {
+                        group_ready
+                    };
+                    if ready {
+                        eligible.push(root.clone());
+                    }
+                    !ready
+                });
+                for root in &eligible {
+                    detached.rearmed_ticks.remove(root);
+                }
+            }
+            if !eligible.is_empty() {
+                if let Some(retired) = detached.retired.as_mut() {
+                    retired.roots.append(&mut eligible);
+                    if !detached.queued {
+                        detached.queued = true;
+                        ready.push(detached.token.clone());
+                    }
+                } else {
+                    detached.ready_roots.append(&mut eligible);
+                }
+            }
+        }
+        if ready.is_empty() {
+            return;
+        }
+        let mut pending = self
+            .pending_cleanups
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for token in ready {
+            pending.push_back(PendingCleanup::Detached(token));
+        }
+        guard.generation += 1;
+        drop(pending);
+        drop(guard);
+        self.signal_changed();
+    }
+
+    /// Applies only observations whose binding still matches the registration.
+    /// A stale or missing observation neither ages nor revives a replacement.
+    pub(crate) fn record_absent_roots(
+        &self,
+        observations: &HashMap<RegistrationId, RootObservation>,
+        threshold: u32,
+    ) -> Vec<RetiredRegistration> {
+        let mut guard = self.lock();
+        let mut expired = Vec::new();
+        let mut detached = Vec::new();
+        let mut revived = Vec::new();
+        for (id, reg) in &mut guard.regs {
+            let Some(observed) = observations.get(id) else {
+                continue;
+            };
+            if !Arc::ptr_eq(&reg.binding, &observed.probe.binding) {
+                continue;
+            }
+            match observed.presence {
+                RootPresence::Present => {
+                    reg.absent_ticks = 0;
+                    reg.checkout_absent_ticks = 0;
+                    if reg.retirement_missing {
+                        reg.retirement_due = false;
+                        reg.retirement_missing = false;
+                        reg.catch_up = CatchUpState::Queued;
+                        revived.push(id.clone());
+                    }
+                    continue;
+                }
+                RootPresence::Absent => {
+                    reg.checkout_absent_ticks = 0;
+                }
+                RootPresence::CheckoutAbsent => {
+                    reg.absent_ticks = 0;
+                    if reg.retirement_missing {
+                        reg.retirement_due = false;
+                        reg.retirement_missing = false;
+                        reg.catch_up = CatchUpState::Queued;
+                        revived.push(id.clone());
+                    }
+                }
+            }
+            if reg.retirement_due {
+                continue;
+            }
+            match observed.presence {
+                RootPresence::Absent => {
+                    reg.absent_ticks = reg.absent_ticks.saturating_add(1);
+                    if reg.absent_ticks >= threshold {
+                        expired.push(id.clone());
+                    }
+                }
+                RootPresence::CheckoutAbsent => {
+                    reg.checkout_absent_ticks = reg.checkout_absent_ticks.saturating_add(1);
+                    if reg.checkout_absent_ticks >= threshold {
+                        detached.push(id.clone());
+                    }
+                }
+                RootPresence::Present => {}
+            }
+        }
+        for id in &revived {
+            self.cancel_deferred(id);
+            guard.queue.push_back(id.clone());
+        }
+        if expired.is_empty() && detached.is_empty() && revived.is_empty() {
+            return Vec::new();
+        }
+        let mut retired = Vec::new();
+        let mut expired_ids = HashSet::new();
+        for id in detached {
+            let Some(registration) = guard.regs.remove(&id) else {
+                continue;
+            };
+            let mut retired = RetiredRegistration::from_registration_with_permit(
+                &id,
+                &registration,
+                &self.retired_runtime,
+                None,
+            );
+            let saved_roots = retired.roots.clone();
+            let ticket = retired._ticket.take();
+            retired.roots.clear();
+            let mut independent_dirs = HashSet::new();
+            for root in &registration.roots {
+                if root.resolution == RootResolution::Resolved && root.canonical_file_root.is_none()
+                {
+                    independent_dirs.insert(root.canonical_watched.clone());
+                }
+            }
+            let token = Arc::new(AtomicBool::new(true));
+            retired.detached = Some(token.clone());
+            guard.detached.push(DetachedRegistration {
+                id: id.clone(),
+                cfg: retired.cfg.clone(),
+                saved_roots: saved_roots.clone(),
+                independent_dirs,
+                binding: registration.binding,
+                token,
+                _ticket: ticket,
+                retired: Some(retired),
+                waiting_roots: saved_roots,
+                ready_roots: Vec::new(),
+                absent_ticks: 0,
+                rearmed_ticks: HashMap::new(),
+                queued: false,
+            });
+            release_admission(&mut guard, &id);
+            expired_ids.insert(id);
+        }
+        for id in expired {
+            if let Some(cleanup) =
+                self.retire_or_defer(&mut guard, &id, RetirementCause::MissingRoot)
+            {
+                retired.push(cleanup);
+            }
+            expired_ids.insert(id);
+        }
+        guard.queue.retain(|id| !expired_ids.contains(id));
+        guard.generation += 1;
+        drop(guard);
+        self.signal_changed();
+        self.settled.notify_waiters();
+        retired
     }
 
     /// Count of registrations currently observed as [`Observation::Degraded`]
@@ -886,7 +1840,12 @@ impl WatchRegistry {
     /// on a pass that is already pending or running.
     pub(crate) fn mark_reconcile_due_all(&self) {
         let mut guard = self.lock();
-        let ids: Vec<RegistrationId> = guard.regs.keys().cloned().collect();
+        let ids: Vec<RegistrationId> = guard
+            .regs
+            .iter()
+            .filter(|(_, reg)| !reg.retirement_due)
+            .map(|(id, _)| id.clone())
+            .collect();
         for id in ids {
             if let Some(reg) = guard.regs.get_mut(&id) {
                 reg.retry_on_tick = false;
@@ -906,7 +1865,9 @@ impl WatchRegistry {
         let Some(reg) = guard.regs.get_mut(id) else {
             return;
         };
-        if matches!(reg.catch_up, CatchUpState::NotStarted | CatchUpState::Done) {
+        if !reg.retirement_due
+            && matches!(reg.catch_up, CatchUpState::NotStarted | CatchUpState::Done)
+        {
             reg.catch_up = CatchUpState::Queued;
             guard.queue.push_back(id.clone());
         }
@@ -937,7 +1898,7 @@ impl WatchRegistry {
             let Some(reg) = inner.regs.get(&id) else {
                 continue;
             };
-            if reg.catch_up != CatchUpState::Queued {
+            if reg.retirement_due || reg.catch_up != CatchUpState::Queued {
                 continue;
             }
             if reg.retry_on_tick {
@@ -962,7 +1923,8 @@ impl WatchRegistry {
                 .iter()
                 .filter(|candidate| {
                     inner.regs.get(*candidate).is_some_and(|member| {
-                        member.catch_up == CatchUpState::Queued
+                        !member.retirement_due
+                            && member.catch_up == CatchUpState::Queued
                             && member.corpus == leader_corpus
                             && member.roots == leader_roots
                             && !cfg_binding_differs(&member.cfg, &leader_cfg)
@@ -1106,6 +2068,7 @@ impl WatchRegistry {
         for (id, reg) in &guard.regs {
             if id.source != *source
                 || !names.contains(reg.corpus.name.as_str())
+                || reg.retirement_due
                 || reg.reconciled_once
                 || reg.last_error.is_some()
             {
@@ -1218,6 +2181,8 @@ mod tests {
             canonical_watched: PathBuf::from(watched),
             corpus,
             canonical_file_root: None,
+            configured_file_root: None,
+            resolution: RootResolution::Resolved,
             mode: notify::RecursiveMode::Recursive,
         }
     }
@@ -1251,6 +2216,527 @@ mod tests {
         assert_eq!(outcome1, RegisterOutcome::New);
         assert_eq!(outcome2, RegisterOutcome::AlreadyRegistered);
         assert_eq!(registry.snapshot_roots().len(), 1);
+    }
+
+    #[test]
+    fn retired_root_claim_requires_same_path_and_ground_store() {
+        let registry = WatchRegistry::new();
+        let mut current = Config::default();
+        current.storage.ground_dir = "/ground-b".into();
+        assert_eq!(
+            registry.register(
+                ConfigSource::Baseline,
+                corpus("current"),
+                Arc::new(current.clone()),
+                vec![root("/target", corpus("current"))],
+            ),
+            RegisterOutcome::New
+        );
+        let mut retired = current.clone();
+        retired.storage.ground_dir = "/ground-a".into();
+        assert!(!registry.live_claims_retired_root(&retired, Path::new("/target")));
+        assert!(!registry.live_claims_retired_root(&current, Path::new("/other")));
+        assert!(registry.live_claims_retired_root(&current, Path::new("/target")));
+    }
+
+    fn detached_registry_at_cap() -> (WatchRegistry, Arc<Config>, Vec<WatchRoot>) {
+        let registry = WatchRegistry::new();
+        let cfg = Arc::new(Config::default());
+        let source = ConfigSource::RepoLayer(PathBuf::from("/old/.hallouminate/config.toml"));
+        let selected = corpus("wiki");
+        let mut file_root = root("/parent", selected.clone());
+        file_root.canonical_file_root = Some(PathBuf::from("/parent/file.md"));
+        file_root.mode = notify::RecursiveMode::NonRecursive;
+        let roots = vec![
+            root("/target", selected.clone()),
+            file_root,
+            root("/secondary", selected.clone()),
+        ];
+        assert_eq!(
+            registry.register(source.clone(), selected, cfg.clone(), roots.clone()),
+            RegisterOutcome::New
+        );
+        for index in 0..MAX_RUNTIME_REGISTRATIONS - 1 {
+            assert_eq!(
+                registry.register(
+                    ConfigSource::RepoLayer(PathBuf::from(format!(
+                        "/other-{index}/.hallouminate/config.toml"
+                    ))),
+                    corpus(&format!("other-{index}")),
+                    cfg.clone(),
+                    vec![],
+                ),
+                RegisterOutcome::New
+            );
+        }
+        let probe = registry
+            .root_probes()
+            .into_iter()
+            .find(|probe| probe.id.source == source)
+            .expect("old source probe");
+        let id = probe.id.clone();
+        let observations = HashMap::from([(
+            id,
+            RootObservation {
+                probe,
+                presence: RootPresence::CheckoutAbsent,
+            },
+        )]);
+        for _ in 0..3 {
+            assert!(registry.record_absent_roots(&observations, 3).is_empty());
+        }
+        assert_eq!(registry.detached_probes().len(), 1);
+        assert_eq!(registry.retired_runtime.load(Ordering::SeqCst), 1);
+        assert_eq!(registry.lock().regs.len(), MAX_RUNTIME_REGISTRATIONS - 1);
+        assert!(
+            registry
+                .repo_layer_sources()
+                .iter()
+                .any(|path| path == Path::new("/old/.hallouminate/config.toml"))
+        );
+        (registry, cfg, roots)
+    }
+
+    #[test]
+    fn detached_slot_reuses_only_exact_full_storage_binding_at_cap() {
+        let (registry, cfg, roots) = detached_registry_at_cap();
+        let source = ConfigSource::RepoLayer(PathBuf::from("/new/.hallouminate/config.toml"));
+        let mut partial = roots.clone();
+        partial[1] = root("/parent", corpus("wiki"));
+        assert_eq!(
+            registry.register(source.clone(), corpus("wiki"), cfg.clone(), partial),
+            RegisterOutcome::LimitReached
+        );
+        let mut changed = (*cfg).clone();
+        changed.storage.ground_dir = "/different-ground".into();
+        assert_eq!(
+            registry.register(
+                source.clone(),
+                corpus("wiki"),
+                Arc::new(changed),
+                roots.clone()
+            ),
+            RegisterOutcome::LimitReached
+        );
+        assert_eq!(registry.detached_probes().len(), 1);
+        assert_eq!(
+            registry.register(source.clone(), corpus("wiki"), cfg, roots),
+            RegisterOutcome::New
+        );
+        assert!(registry.detached_probes().is_empty());
+        assert_eq!(registry.retired_runtime.load(Ordering::SeqCst), 0);
+        assert_eq!(registry.lock().regs.len(), MAX_RUNTIME_REGISTRATIONS);
+        assert!(
+            !registry
+                .repo_layer_sources()
+                .iter()
+                .any(|path| path == Path::new("/old/.hallouminate/config.toml"))
+        );
+    }
+
+    #[test]
+    fn ticketless_baseline_retirement_cannot_credit_a_runtime_slot() {
+        let registry = WatchRegistry::new();
+        let cfg = Arc::new(Config::default());
+        let selected = corpus("wiki");
+        let roots = vec![root("/target", selected.clone())];
+        registry.seed_baseline(selected.clone(), cfg.clone(), roots.clone());
+        let probe = registry
+            .root_probes()
+            .into_iter()
+            .find(|probe| probe.id.source == ConfigSource::Baseline)
+            .expect("baseline probe");
+        let observations = HashMap::from([(
+            probe.id.clone(),
+            RootObservation {
+                probe,
+                presence: RootPresence::Absent,
+            },
+        )]);
+        let mut retired = Vec::new();
+        for _ in 0..3 {
+            retired.extend(registry.record_absent_roots(&observations, 3));
+        }
+        assert_eq!(retired.len(), 1);
+        assert!(retired[0]._ticket.is_none());
+        for index in 0..MAX_RUNTIME_REGISTRATIONS {
+            assert_eq!(
+                registry.register(
+                    ConfigSource::RepoLayer(PathBuf::from(format!("/other-{index}/config.toml"))),
+                    corpus(&format!("other-{index}")),
+                    cfg.clone(),
+                    vec![],
+                ),
+                RegisterOutcome::New
+            );
+        }
+        let source = ConfigSource::RepoLayer(PathBuf::from("/new/config.toml"));
+        assert_eq!(
+            registry.register(source.clone(), selected.clone(), cfg.clone(), roots.clone()),
+            RegisterOutcome::LimitReached,
+            "a Baseline owner cannot transfer a runtime slot"
+        );
+        assert!(
+            registry
+                .replace_source(source, vec![selected], cfg, |_| roots.clone())
+                .is_err()
+        );
+        assert_eq!(registry.lock().regs.len(), MAX_RUNTIME_REGISTRATIONS);
+        assert_eq!(registry.retired_runtime.load(Ordering::SeqCst), 0);
+        assert!(
+            retired[0]
+                .ordinary_owner
+                .as_ref()
+                .expect("baseline owner")
+                .load(Ordering::SeqCst)
+        );
+    }
+
+    #[test]
+    fn ordinary_runtime_retirement_transfers_exact_slot_at_cap() {
+        let registry = WatchRegistry::new();
+        let cfg = Arc::new(Config::default());
+        let selected = corpus("wiki");
+        let roots = vec![root("/target", selected.clone())];
+        let source = ConfigSource::RepoLayer(PathBuf::from("/old/config.toml"));
+        assert_eq!(
+            registry.register(source.clone(), selected.clone(), cfg.clone(), roots.clone()),
+            RegisterOutcome::New
+        );
+        for index in 0..MAX_RUNTIME_REGISTRATIONS - 1 {
+            assert_eq!(
+                registry.register(
+                    ConfigSource::RepoLayer(PathBuf::from(format!("/other-{index}/config.toml"))),
+                    corpus(&format!("other-{index}")),
+                    cfg.clone(),
+                    vec![],
+                ),
+                RegisterOutcome::New
+            );
+        }
+        let probe = registry
+            .root_probes()
+            .into_iter()
+            .find(|probe| probe.id.source == source)
+            .expect("runtime probe");
+        let observations = HashMap::from([(
+            probe.id.clone(),
+            RootObservation {
+                probe,
+                presence: RootPresence::Absent,
+            },
+        )]);
+        let mut retired = Vec::new();
+        for _ in 0..3 {
+            retired.extend(registry.record_absent_roots(&observations, 3));
+        }
+        assert_eq!(retired.len(), 1);
+        assert_eq!(registry.retired_runtime.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            registry.register(
+                ConfigSource::RepoLayer(PathBuf::from("/new/config.toml")),
+                selected,
+                cfg,
+                roots,
+            ),
+            RegisterOutcome::New,
+        );
+        assert_eq!(registry.retired_runtime.load(Ordering::SeqCst), 0);
+        assert_eq!(registry.lock().regs.len(), MAX_RUNTIME_REGISTRATIONS);
+        assert!(
+            !retired[0]
+                .ordinary_owner
+                .as_ref()
+                .expect("runtime owner")
+                .load(Ordering::SeqCst)
+        );
+    }
+
+    #[test]
+    fn pr_786_register_reclaims_permuted_secondary_roots_at_cap() {
+        let (registry, cfg, roots) = detached_registry_at_cap();
+        let source = ConfigSource::RepoLayer(PathBuf::from("/new/.hallouminate/config.toml"));
+        let mut permuted = roots.clone();
+        permuted.swap(1, 2);
+        let mut duplicated = permuted.clone();
+        duplicated[1] = duplicated[2].clone();
+        assert_eq!(
+            registry.register(source.clone(), corpus("wiki"), cfg.clone(), duplicated),
+            RegisterOutcome::LimitReached,
+            "duplicate keys cannot replace a missing physical root"
+        );
+        let mut unresolved = permuted.clone();
+        unresolved[1].resolution = RootResolution::Unresolved;
+        assert_eq!(
+            registry.register(source.clone(), corpus("wiki"), cfg.clone(), unresolved),
+            RegisterOutcome::LimitReached,
+        );
+        let mut changed_file = permuted.clone();
+        changed_file[2] = root("/parent", corpus("wiki"));
+        assert_eq!(
+            registry.register(source.clone(), corpus("wiki"), cfg.clone(), changed_file),
+            RegisterOutcome::LimitReached,
+            "the watched parent cannot replace the exact file key"
+        );
+        let mut changed_primary = permuted.clone();
+        changed_primary[0] = root("/new-primary", corpus("wiki"));
+        assert_eq!(
+            registry.register(source.clone(), corpus("wiki"), cfg.clone(), changed_primary),
+            RegisterOutcome::LimitReached,
+        );
+        let mut changed_cfg = (*cfg).clone();
+        changed_cfg.embeddings.model = "different-model".into();
+        assert_eq!(
+            registry.register(
+                source.clone(),
+                corpus("wiki"),
+                Arc::new(changed_cfg),
+                permuted.clone()
+            ),
+            RegisterOutcome::LimitReached,
+        );
+        assert_eq!(registry.detached_probes().len(), 1);
+        assert_eq!(registry.retired_runtime.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            registry.register(
+                source.clone(),
+                corpus("wiki"),
+                cfg.clone(),
+                permuted.clone()
+            ),
+            RegisterOutcome::New,
+            "the same physical roots reuse the detached ticket at cap"
+        );
+        assert!(registry.detached_probes().is_empty());
+        assert_eq!(registry.retired_runtime.load(Ordering::SeqCst), 0);
+        assert!(registry.is_registered_unchanged(&source, &corpus("wiki"), &cfg, &permuted));
+        assert!(!registry.is_registered_unchanged(&source, &corpus("wiki"), &cfg, &roots));
+    }
+
+    #[test]
+    fn pr_786_reload_reclaims_permuted_secondary_roots_at_cap() {
+        let (registry, cfg, roots) = detached_registry_at_cap();
+        let source = ConfigSource::RepoLayer(PathBuf::from("/reload/.hallouminate/config.toml"));
+        let mut permuted = roots.clone();
+        permuted.swap(1, 2);
+        registry
+            .replace_source(source.clone(), vec![corpus("wiki")], cfg.clone(), |_| {
+                permuted.clone()
+            })
+            .expect("permuted reload reuses the detached ticket at cap");
+        assert!(registry.detached_probes().is_empty());
+        assert_eq!(registry.retired_runtime.load(Ordering::SeqCst), 0);
+        assert!(registry.is_registered_unchanged(&source, &corpus("wiki"), &cfg, &permuted));
+    }
+
+    #[test]
+    fn detached_slot_reloads_exact_match_even_with_unmatched_overflow() {
+        let (registry, cfg, roots) = detached_registry_at_cap();
+        let source = ConfigSource::RepoLayer(PathBuf::from("/new/.hallouminate/config.toml"));
+        assert!(
+            registry
+                .replace_source(
+                    source.clone(),
+                    vec![corpus("wiki"), corpus("overflow")],
+                    cfg.clone(),
+                    |corpus| {
+                        if corpus.name == "wiki" {
+                            roots.clone()
+                        } else {
+                            vec![root("/overflow", corpus.clone())]
+                        }
+                    },
+                )
+                .is_err()
+        );
+        assert!(registry.detached_probes().is_empty());
+        assert_eq!(registry.retired_runtime.load(Ordering::SeqCst), 0);
+        assert_eq!(registry.lock().regs.len(), MAX_RUNTIME_REGISTRATIONS);
+        assert!(registry.is_registered_unchanged(&source, &corpus("wiki"), &cfg, &roots));
+        assert!(!registry.is_registered_unchanged(
+            &source,
+            &corpus("overflow"),
+            &cfg,
+            &[root("/overflow", corpus("overflow"))]
+        ));
+    }
+
+    #[test]
+    fn detached_obligations_with_same_id_keep_distinct_storage() {
+        let registry = WatchRegistry::new();
+        let source = ConfigSource::RepoLayer(PathBuf::from("/repo/.hallouminate/config.toml"));
+        let roots = vec![root("/target", corpus("wiki"))];
+        for ground in ["/ground-a", "/ground-b"] {
+            let mut cfg = Config::default();
+            cfg.storage.ground_dir = ground.into();
+            assert_eq!(
+                registry.register(source.clone(), corpus("wiki"), Arc::new(cfg), roots.clone()),
+                RegisterOutcome::New
+            );
+            let probe = registry.root_probes().pop().expect("active probe");
+            let observations = HashMap::from([(
+                probe.id.clone(),
+                RootObservation {
+                    probe,
+                    presence: RootPresence::CheckoutAbsent,
+                },
+            )]);
+            for _ in 0..3 {
+                assert!(registry.record_absent_roots(&observations, 3).is_empty());
+            }
+        }
+        let guard = registry.lock();
+        assert_eq!(guard.detached.len(), 2);
+        let mut grounds = Vec::new();
+        for detached in &guard.detached {
+            grounds.push(detached.cfg.storage.ground_dir.clone());
+        }
+        grounds.sort();
+        assert_eq!(grounds, ["/ground-a", "/ground-b"]);
+        assert_eq!(registry.retired_runtime.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn detached_waiting_root_rearms_while_failed_sibling_is_active() {
+        let (registry, cfg, roots) = detached_registry_at_cap();
+        let (binding, saved) = registry.detached_probes().pop().expect("detached roots");
+        for _ in 0..3 {
+            registry.record_detached_absence(
+                &[DetachedRootObservation {
+                    binding: binding.clone(),
+                    absences: saved.iter().cloned().map(|root| (root, true)).collect(),
+                }],
+                3,
+            );
+        }
+        let mut old = registry.take_pending_cleanups().pop().expect("old cleanup");
+        old.roots = vec![saved[1].clone()];
+        old.waiting_roots = vec![saved[0].clone()];
+        registry.park_failed_cleanup(old);
+        assert_eq!(registry.retired_runtime.load(Ordering::SeqCst), 1);
+
+        let mut failed = registry
+            .take_pending_cleanups()
+            .pop()
+            .expect("failed sibling retry");
+        assert_eq!(failed.roots, vec![saved[1].clone()]);
+        let (binding, waiting) = registry.detached_probes().pop().expect("waiting root");
+        assert_eq!(waiting, vec![saved[0].clone()]);
+        for _ in 0..3 {
+            registry.record_detached_absence(
+                &[DetachedRootObservation {
+                    binding: binding.clone(),
+                    absences: waiting.iter().cloned().map(|root| (root, true)).collect(),
+                }],
+                3,
+            );
+        }
+        failed.roots.clear();
+        registry.park_failed_cleanup(failed);
+        let ready = registry
+            .take_pending_cleanups()
+            .pop()
+            .expect("returned root must rearm independently");
+        assert_eq!(ready.roots, vec![saved[0].clone()]);
+
+        let source = ConfigSource::RepoLayer(PathBuf::from("/new/.hallouminate/config.toml"));
+        assert_eq!(
+            registry.register(source, corpus("wiki"), cfg, roots),
+            RegisterOutcome::New
+        );
+        assert_eq!(registry.retired_runtime.load(Ordering::SeqCst), 0);
+        assert!(
+            !ready
+                .detached
+                .as_ref()
+                .expect("detached token")
+                .load(Ordering::SeqCst)
+        );
+        registry.park_failed_cleanup(ready);
+        assert!(registry.take_pending_cleanups().is_empty());
+    }
+
+    #[test]
+    fn pr_786_rearmed_directory_counts_once_and_does_not_release_file() {
+        let (registry, _cfg, _roots) = detached_registry_at_cap();
+        let (binding, saved) = registry.detached_probes().pop().expect("detached roots");
+        for _ in 0..3 {
+            let absences = saved.iter().cloned().map(|root| (root, true)).collect();
+            registry.record_detached_absence(
+                &[DetachedRootObservation {
+                    binding: binding.clone(),
+                    absences,
+                }],
+                3,
+            );
+        }
+        let mut old = registry
+            .take_pending_cleanups()
+            .pop()
+            .expect("initial cleanup");
+        old.roots.clear();
+        old.waiting_roots = vec![
+            saved[0].clone(),
+            saved[0].clone(),
+            saved[1].clone(),
+            saved[2].clone(),
+        ];
+        registry.park_failed_cleanup(old);
+        let (binding, waiting) = registry.detached_probes().pop().expect("rearmed roots");
+        assert_eq!(waiting.len(), 4);
+        let absent_target = vec![
+            (saved[0].clone(), true),
+            (saved[1].clone(), false),
+            (saved[2].clone(), false),
+        ];
+        for _ in 0..2 {
+            registry.record_detached_absence(
+                &[DetachedRootObservation {
+                    binding: binding.clone(),
+                    absences: absent_target.clone(),
+                }],
+                3,
+            );
+        }
+        assert!(registry.take_pending_cleanups().is_empty());
+        let present_target = vec![
+            (saved[0].clone(), false),
+            (saved[1].clone(), false),
+            (saved[2].clone(), false),
+        ];
+        registry.record_detached_absence(
+            &[DetachedRootObservation {
+                binding: binding.clone(),
+                absences: present_target,
+            }],
+            3,
+        );
+        for _ in 0..2 {
+            registry.record_detached_absence(
+                &[DetachedRootObservation {
+                    binding: binding.clone(),
+                    absences: absent_target.clone(),
+                }],
+                3,
+            );
+        }
+        assert!(registry.take_pending_cleanups().is_empty());
+        registry.record_detached_absence(
+            &[DetachedRootObservation {
+                binding,
+                absences: absent_target,
+            }],
+            3,
+        );
+        let ready = registry.take_pending_cleanups();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].roots, vec![saved[0].clone(), saved[0].clone()]);
+        let (_, waiting) = registry
+            .detached_probes()
+            .pop()
+            .expect("other roots remain");
+        assert_eq!(waiting, vec![saved[1].clone(), saved[2].clone()]);
+        assert_eq!(registry.retired_runtime.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -1298,6 +2784,54 @@ mod tests {
 
         assert_eq!(outcome, RegisterOutcome::LimitReached);
         assert_eq!(registry.generation(), generation_before);
+    }
+
+    #[test]
+    fn over_limit_reload_revives_declared_deferred_registration() {
+        let registry = WatchRegistry::new();
+        let cfg = Arc::new(Config::default());
+        let source = ConfigSource::RepoLayer(PathBuf::from("/repo"));
+        let selected = corpus("wiki");
+        registry.register(source.clone(), selected.clone(), cfg.clone(), vec![]);
+        let held: Vec<_> = (0..MAX_PENDING_CLEANUPS)
+            .map(|_| {
+                registry
+                    .cleanup_slots
+                    .clone()
+                    .try_acquire_owned()
+                    .expect("slot")
+            })
+            .collect();
+        assert!(
+            registry
+                .replace_source(source.clone(), vec![], cfg.clone(), |_| vec![])
+                .expect("defer removal")
+                .is_empty()
+        );
+        for index in 0..MAX_RUNTIME_REGISTRATIONS - 1 {
+            assert_eq!(
+                registry.register(
+                    ConfigSource::RepoLayer(PathBuf::from(format!("/other-{index}"))),
+                    corpus(&format!("other-{index}")),
+                    cfg.clone(),
+                    vec![],
+                ),
+                RegisterOutcome::New
+            );
+        }
+        assert!(
+            registry
+                .replace_source(
+                    source.clone(),
+                    vec![selected.clone(), corpus("over-cap")],
+                    cfg.clone(),
+                    |_| vec![],
+                )
+                .is_err()
+        );
+        assert!(registry.is_registered_unchanged(&source, &selected, &cfg, &[]));
+        drop(held);
+        assert!(registry.take_pending_cleanups().is_empty());
     }
 
     #[test]
@@ -1774,6 +3308,74 @@ mod tests {
     }
 
     #[test]
+    fn identical_reconcile_failures_re_warn_at_the_reminder_cadence() {
+        let registry = WatchRegistry::new();
+        let cfg = Arc::new(Config::default());
+        let source = ConfigSource::RepoLayer(PathBuf::from("/repo"));
+        let wiki = corpus("wiki");
+        let wiki_root = root("/repo", wiki.clone());
+        registry.register(source.clone(), wiki, cfg, vec![wiki_root]);
+        let id = RegistrationId {
+            source,
+            corpus_key: CorpusKey {
+                name: "wiki".into(),
+                canonical_root: PathBuf::from("/repo"),
+            },
+        };
+        assert!(!registry.repeats_last_error(&id, "boom"));
+        registry.finish_catch_up(&id, Err("boom".into()));
+
+        let mut warned = 0;
+        for _ in 0..REPEAT_FAILURE_REMINDER_EVERY * 2 {
+            if !registry.repeats_last_error(&id, "boom") {
+                warned += 1;
+            }
+        }
+        assert_eq!(
+            warned, 2,
+            "a long identical failure run must re-warn periodically"
+        );
+    }
+
+    #[test]
+    fn pending_cleanups_retain_every_admitted_registration() {
+        let registry = WatchRegistry::new();
+        let cfg = Arc::new(Config::default());
+        for index in 0..=MAX_PENDING_CLEANUPS {
+            registry.park_failed_cleanup(RetiredRegistration {
+                corpus: format!("c{index}"),
+                root: PathBuf::from("/gone"),
+                roots: vec![PathBuf::from("/gone")],
+                lock_keys: Vec::new(),
+                cfg: cfg.clone(),
+                failed_attempts: 0,
+                detached: None,
+                ordinary_owner: None,
+                log_missing_root: false,
+                waiting_roots: Vec::new(),
+                _permit: None,
+                _ticket: None,
+            });
+        }
+        let mut active = registry.take_pending_cleanups();
+        assert_eq!(active.len(), MAX_PENDING_CLEANUPS);
+        assert_eq!(active[0].corpus, "c0");
+        assert_eq!(active[MAX_PENDING_CLEANUPS - 1].corpus, "c63");
+        assert!(registry.cleanup_slots.clone().try_acquire_owned().is_err());
+        assert!(registry.take_pending_cleanups().is_empty());
+
+        registry.park_failed_cleanup(active.remove(0));
+        let next = registry.take_pending_cleanups();
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].corpus, "c64", "new work precedes the retry");
+        drop(next);
+        drop(active);
+        let retry = registry.take_pending_cleanups();
+        assert_eq!(retry.len(), 1);
+        assert_eq!(retry[0].corpus, "c0", "failed work stays retryable");
+    }
+
+    #[test]
     fn incompatible_selection_rules_do_not_share_admission() {
         let registry = WatchRegistry::new();
         let cfg = Arc::new(Config::default());
@@ -2065,6 +3667,123 @@ mod tests {
     }
 
     #[test]
+    fn repeated_pass_failure_is_recognized_until_a_success_clears_it() {
+        let registry = WatchRegistry::new();
+        let cfg = Arc::new(Config::default());
+        registry.register(ConfigSource::Baseline, corpus("wiki"), cfg, vec![]);
+        let id = baseline_id("wiki");
+
+        assert!(!registry.repeats_last_error(&id, "walk error"));
+        assert_eq!(registry.begin_next_catch_up(1), Some(id.clone()));
+        registry.finish_catch_up(&id, Err("walk error".into()));
+        assert!(registry.repeats_last_error(&id, "walk error"));
+        assert!(!registry.repeats_last_error(&id, "other error"));
+
+        registry.mark_reconcile_due_all();
+        assert_eq!(registry.begin_next_catch_up(1), Some(id.clone()));
+        registry.finish_catch_up(&id, Ok(()));
+        assert!(!registry.repeats_last_error(&id, "walk error"));
+    }
+
+    #[test]
+    fn absent_root_count_resets_on_return_and_retires_at_threshold() {
+        let registry = WatchRegistry::new();
+        let a = register_baseline(&registry, "a");
+        let b = register_baseline(&registry, "b");
+        let probe = registry
+            .root_probes()
+            .into_iter()
+            .find(|probe| probe.id == a)
+            .expect("a probe");
+        let only_a = HashMap::from([(
+            a.clone(),
+            RootObservation {
+                probe,
+                presence: RootPresence::Absent,
+            },
+        )]);
+        let present_probe = registry
+            .root_probes()
+            .into_iter()
+            .find(|probe| probe.id == a)
+            .expect("present probe");
+        let present_a = HashMap::from([(
+            a.clone(),
+            RootObservation {
+                probe: present_probe,
+                presence: RootPresence::Present,
+            },
+        )]);
+
+        assert!(registry.record_absent_roots(&only_a, 3).is_empty());
+        assert!(registry.record_absent_roots(&only_a, 3).is_empty());
+        assert!(registry.record_absent_roots(&present_a, 3).is_empty());
+        assert!(registry.record_absent_roots(&only_a, 3).is_empty());
+        assert!(registry.record_absent_roots(&only_a, 3).is_empty());
+        assert!(
+            registry.observation(&a).is_some(),
+            "a reset count must restart from zero"
+        );
+
+        let generation = registry.generation();
+        let retired = registry.record_absent_roots(&only_a, 3);
+        let names: Vec<&str> = retired.iter().map(|r| r.corpus.as_str()).collect();
+        assert_eq!(names, vec!["a"]);
+        assert_eq!(retired[0].root, a.corpus_key.canonical_root);
+        assert!(registry.observation(&a).is_none());
+        assert!(registry.observation(&b).is_some());
+        assert_eq!(registry.catch_up_state(&a), None);
+        assert!(registry.generation() > generation);
+        assert_ne!(registry.begin_next_catch_up(2), Some(a));
+    }
+
+    #[test]
+    fn pr_786_retirement_followup_stale_probe_does_not_age_replacement() {
+        let registry = WatchRegistry::new();
+        let id = register_baseline(&registry, "wiki");
+        let old_probe = registry.root_probes();
+        let replacement = corpus("wiki");
+        assert_eq!(
+            registry.register(
+                ConfigSource::Baseline,
+                replacement.clone(),
+                Arc::new(Config::default()),
+                vec![
+                    root("/wiki", replacement.clone()),
+                    root("/new", replacement)
+                ],
+            ),
+            RegisterOutcome::New
+        );
+        let stale = HashMap::from([(
+            old_probe[0].id.clone(),
+            RootObservation {
+                probe: old_probe.into_iter().next().expect("old probe"),
+                presence: RootPresence::Absent,
+            },
+        )]);
+        let current_probe = registry
+            .root_probes()
+            .into_iter()
+            .next()
+            .expect("current probe");
+        let current = HashMap::from([(
+            current_probe.id.clone(),
+            RootObservation {
+                probe: current_probe,
+                presence: RootPresence::Absent,
+            },
+        )]);
+        assert!(registry.record_absent_roots(&stale, 3).is_empty());
+        assert!(registry.record_absent_roots(&current, 3).is_empty());
+        assert!(registry.record_absent_roots(&current, 3).is_empty());
+        assert!(
+            registry.observation(&id).is_some(),
+            "replacement needs its own three ticks"
+        );
+    }
+
+    #[test]
     fn recovery_warnings_clear_after_successful_recovery() {
         let registry = WatchRegistry::new();
         let cfg = Arc::new(Config::default());
@@ -2237,8 +3956,18 @@ mod tests {
     fn refresh_roots_rekeys_registration_when_canonical_root_changes() {
         let registry = WatchRegistry::new();
         let cfg = Arc::new(Config::default());
-        registry.register(ConfigSource::Baseline, corpus("wiki"), cfg, vec![]);
-        let old_id = baseline_id("wiki");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut selected = corpus("wiki");
+        let configured = temp.path().join("absent");
+        selected.paths = vec![configured.to_string_lossy().into_owned()];
+        registry.register(ConfigSource::Baseline, selected, cfg, vec![]);
+        let old_id = RegistrationId {
+            source: ConfigSource::Baseline,
+            corpus_key: CorpusKey {
+                name: "wiki".into(),
+                canonical_root: configured,
+            },
+        };
         registry.record_pending(&old_id, [PathBuf::from("/a/changed.md")]);
 
         registry.refresh_roots(|c| vec![root("/newly/resolved", c.clone())]);
@@ -2265,6 +3994,62 @@ mod tests {
     }
 
     #[test]
+    fn pr_786_refresh_rekey_reclaims_exact_detached_binding() {
+        let registry = WatchRegistry::new();
+        let cfg = Arc::new(Config::default());
+        let selected = corpus("wiki");
+        let old_source = ConfigSource::RepoLayer(PathBuf::from("/old/.hallouminate/config.toml"));
+        let saved = vec![
+            root("/target", selected.clone()),
+            root("/secondary", selected.clone()),
+        ];
+        assert_eq!(
+            registry.register(
+                old_source.clone(),
+                selected.clone(),
+                cfg.clone(),
+                saved.clone()
+            ),
+            RegisterOutcome::New
+        );
+        let probe = registry
+            .root_probes()
+            .into_iter()
+            .find(|probe| probe.id.source == old_source)
+            .expect("old source probe");
+        let observations = HashMap::from([(
+            probe.id.clone(),
+            RootObservation {
+                probe,
+                presence: RootPresence::CheckoutAbsent,
+            },
+        )]);
+        for _ in 0..3 {
+            assert!(registry.record_absent_roots(&observations, 3).is_empty());
+        }
+        assert_eq!(registry.detached_probes().len(), 1);
+
+        let source = ConfigSource::RepoLayer(PathBuf::from("/new/.hallouminate/config.toml"));
+        let partial = vec![
+            root("/temporary", selected.clone()),
+            root("/secondary", selected.clone()),
+        ];
+        assert_eq!(
+            registry.register(source.clone(), selected.clone(), cfg, partial),
+            RegisterOutcome::New
+        );
+        assert_eq!(registry.detached_probes().len(), 1);
+        registry.refresh_roots(|_| saved.clone());
+        let roots = registry.snapshot_roots();
+        assert_eq!(roots.len(), 2);
+        for (id, _) in roots {
+            assert_eq!(id.corpus_key.canonical_root, PathBuf::from("/target"));
+        }
+        assert!(registry.detached_probes().is_empty());
+        assert_eq!(registry.retired_runtime.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn refresh_roots_rekey_of_in_flight_registration_releases_the_slot() {
         let registry = WatchRegistry::new();
         let cfg = Arc::new(Config::default());
@@ -2288,6 +4073,119 @@ mod tests {
         );
         assert_eq!(registry.finish_catch_up(&old_id, Ok(())), PendingWork::Idle);
         assert_eq!(registry.begin_next_catch_up(1), Some(new_id));
+    }
+
+    #[test]
+    fn pr_786_refresh_roots_does_not_apply_stale_same_id_snapshot() {
+        let registry = WatchRegistry::new();
+        let cfg = Arc::new(Config::default());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let a = temp.path().join("a");
+        let b = temp.path().join("b");
+        let c = temp.path().join("c");
+        for path in [&a, &b, &c] {
+            std::fs::create_dir(path).expect("create root");
+        }
+        let old = corpus_at("wiki", &[a.to_str().expect("a"), b.to_str().expect("b")]);
+        let replacement = corpus_at("wiki", &[a.to_str().expect("a"), c.to_str().expect("c")]);
+        assert_eq!(
+            registry.register(
+                ConfigSource::Baseline,
+                old.clone(),
+                cfg.clone(),
+                super::super::watch_roots_for(&old),
+            ),
+            RegisterOutcome::New
+        );
+        registry.refresh_roots(|snapshot| {
+            assert_eq!(snapshot.paths, old.paths);
+            assert_eq!(
+                registry.register(
+                    ConfigSource::Baseline,
+                    replacement.clone(),
+                    cfg.clone(),
+                    super::super::watch_roots_for(&replacement),
+                ),
+                RegisterOutcome::New
+            );
+            super::super::watch_roots_for(snapshot)
+        });
+        let actual: Vec<PathBuf> = registry
+            .snapshot_roots()
+            .into_iter()
+            .map(|(_, root)| root.canonical_watched)
+            .collect();
+        assert_eq!(
+            actual,
+            vec![a, c],
+            "replacement roots must survive stale refresh"
+        );
+        assert!(!actual.contains(&b), "removed root must not remain routed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pr_786_refresh_roots_does_not_rekey_stale_replacement() {
+        use std::os::unix::fs::symlink;
+
+        let registry = WatchRegistry::new();
+        let cfg = Arc::new(Config::default());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        let b = temp.path().join("b");
+        let c = temp.path().join("c");
+        for path in [&first, &second, &b, &c] {
+            std::fs::create_dir(path).expect("create root");
+        }
+        let alias = temp.path().join("a");
+        symlink(&first, &alias).expect("first alias");
+        let old = corpus_at(
+            "wiki",
+            &[alias.to_str().expect("alias"), b.to_str().expect("b")],
+        );
+        let replacement = corpus_at(
+            "wiki",
+            &[alias.to_str().expect("alias"), c.to_str().expect("c")],
+        );
+        assert_eq!(
+            registry.register(
+                ConfigSource::Baseline,
+                old.clone(),
+                cfg.clone(),
+                super::super::watch_roots_for(&old),
+            ),
+            RegisterOutcome::New
+        );
+        registry.refresh_roots(|snapshot| {
+            assert_eq!(snapshot.paths, old.paths);
+            assert_eq!(
+                registry.register(
+                    ConfigSource::Baseline,
+                    replacement.clone(),
+                    cfg.clone(),
+                    super::super::watch_roots_for(&replacement),
+                ),
+                RegisterOutcome::New
+            );
+            std::fs::remove_file(&alias).expect("remove first alias");
+            symlink(&second, &alias).expect("retarget alias");
+            super::super::watch_roots_for(snapshot)
+        });
+        let roots = registry.snapshot_roots();
+        assert_eq!(roots.len(), 2, "replacement keeps both roots");
+        assert_eq!(roots[0].0.corpus_key.canonical_root, first);
+        assert_eq!(roots[1].0.corpus_key.canonical_root, first);
+        let actual: Vec<PathBuf> = roots
+            .into_iter()
+            .map(|(_, root)| root.canonical_watched)
+            .collect();
+        assert_eq!(
+            actual,
+            vec![first, c],
+            "stale rekey must not move replacement"
+        );
+        assert!(!actual.contains(&b), "removed root must not remain routed");
     }
 
     #[test]
@@ -2449,6 +4347,261 @@ mod tests {
             Some(PendingWork::FullRoot),
             "the still-present registration must remain untouched"
         );
+    }
+
+    #[test]
+    fn config_replacement_defers_excess_retirements_without_losing_them() {
+        let registry = WatchRegistry::new();
+        let cfg = Arc::new(Config::default());
+        let source = ConfigSource::RepoLayer(PathBuf::from("/repo"));
+        let corpora: Vec<_> = (0..=MAX_PENDING_CLEANUPS)
+            .map(|index| corpus(&format!("c{index}")))
+            .collect();
+        registry
+            .replace_source(source.clone(), corpora, cfg.clone(), |_| vec![])
+            .expect("register");
+
+        let retired = registry
+            .replace_source(source.clone(), vec![], cfg.clone(), |_| vec![])
+            .expect("first replacement");
+        assert_eq!(retired.len(), MAX_PENDING_CLEANUPS);
+        assert_eq!(registry.repo_layer_sources(), vec![PathBuf::from("/repo")]);
+        let blocked = registry
+            .replace_source(source.clone(), vec![], cfg.clone(), |_| vec![])
+            .expect("blocked replacement");
+        assert!(
+            blocked.is_empty(),
+            "held cleanup permits must defer retirement"
+        );
+        drop(retired);
+        let last = registry.take_pending_cleanups();
+        assert_eq!(
+            last.len(),
+            1,
+            "the omitted registration must retire on retry"
+        );
+        assert!(registry.repo_layer_sources().is_empty());
+        assert!(registry.take_pending_cleanups().is_empty());
+    }
+
+    #[test]
+    fn rediscovery_keeps_an_obsolete_deferred_cleanup() {
+        let registry = WatchRegistry::new();
+        let cfg = Arc::new(Config::default());
+        let source = ConfigSource::RepoLayer(PathBuf::from("/repo"));
+        let selected = corpus("wiki");
+        let old_root = root("/old", selected.clone());
+        registry.register(
+            source.clone(),
+            selected.clone(),
+            cfg.clone(),
+            vec![old_root],
+        );
+        let held: Vec<_> = (0..MAX_PENDING_CLEANUPS)
+            .map(|_| {
+                registry
+                    .cleanup_slots
+                    .clone()
+                    .try_acquire_owned()
+                    .expect("cleanup slot")
+            })
+            .collect();
+        assert!(
+            registry
+                .replace_source(source.clone(), vec![], cfg.clone(), |_| vec![])
+                .expect("defer old root")
+                .is_empty()
+        );
+        assert!(
+            registry.snapshot_roots().is_empty(),
+            "a deferred removal must stop watching"
+        );
+        assert_eq!(
+            registry.begin_next_catch_up(1),
+            None,
+            "a deferred removal must not reindex"
+        );
+
+        let outcome = registry.register(
+            source.clone(),
+            selected.clone(),
+            cfg,
+            vec![root("/new", selected)],
+        );
+        assert_eq!(outcome, RegisterOutcome::New);
+        drop(held);
+        let retired = registry.take_pending_cleanups();
+        assert_eq!(
+            retired.len(),
+            1,
+            "rediscovery must not erase the old cleanup"
+        );
+        assert_eq!(retired[0].roots[0], PathBuf::from("/old"));
+        assert_eq!(
+            registry.snapshot_roots().len(),
+            1,
+            "the new root must stay watched"
+        );
+    }
+
+    #[test]
+    fn same_id_rediscovery_revives_a_deferred_registration() {
+        let registry = WatchRegistry::new();
+        let cfg = Arc::new(Config::default());
+        let source = ConfigSource::RepoLayer(PathBuf::from("/repo"));
+        registry.register(source.clone(), corpus("wiki"), cfg.clone(), vec![]);
+        let held: Vec<_> = (0..MAX_PENDING_CLEANUPS)
+            .map(|_| {
+                registry
+                    .cleanup_slots
+                    .clone()
+                    .try_acquire_owned()
+                    .expect("cleanup slot")
+            })
+            .collect();
+        assert!(
+            registry
+                .replace_source(source.clone(), vec![], cfg.clone(), |_| vec![])
+                .expect("defer root")
+                .is_empty()
+        );
+        assert_eq!(registry.begin_next_catch_up(1), None);
+        let outcome = registry.register(source, corpus("wiki"), cfg, vec![]);
+        assert_eq!(
+            outcome,
+            RegisterOutcome::New,
+            "rediscovery must queue a fresh pass"
+        );
+        assert_eq!(
+            registry.begin_next_catch_up(1),
+            Some(RegistrationId {
+                source: ConfigSource::RepoLayer(PathBuf::from("/repo")),
+                corpus_key: CorpusKey {
+                    name: "wiki".into(),
+                    canonical_root: PathBuf::new()
+                }
+            })
+        );
+        drop(held);
+        assert!(
+            registry.take_pending_cleanups().is_empty(),
+            "revived root must not retire"
+        );
+    }
+
+    #[test]
+    fn missing_root_retirement_defers_excess_without_dropping_registrations() {
+        let registry = WatchRegistry::new();
+        let cfg = Arc::new(Config::default());
+        for index in 0..=MAX_PENDING_CLEANUPS {
+            let name = format!("c{index}");
+            registry.register(ConfigSource::Baseline, corpus(&name), cfg.clone(), vec![]);
+        }
+        let mut absent = HashMap::new();
+        for probe in registry.root_probes() {
+            absent.insert(
+                probe.id.clone(),
+                RootObservation {
+                    probe,
+                    presence: RootPresence::Absent,
+                },
+            );
+        }
+        let retired = registry.record_absent_roots(&absent, 1);
+        assert_eq!(retired.len(), MAX_PENDING_CLEANUPS);
+        assert!(registry.record_absent_roots(&absent, 1).is_empty());
+        drop(retired);
+        let last = registry.take_pending_cleanups();
+        assert_eq!(
+            last.len(),
+            1,
+            "the deferred registration must retire on a later tick"
+        );
+        assert!(registry.root_probes().is_empty());
+    }
+
+    #[test]
+    fn deferred_missing_root_revives_before_cleanup_admission() {
+        let registry = WatchRegistry::new();
+        let cfg = Arc::new(Config::default());
+        for index in 0..=MAX_PENDING_CLEANUPS {
+            let name = format!("c{index}");
+            registry.register(ConfigSource::Baseline, corpus(&name), cfg.clone(), vec![]);
+        }
+        let mut absent = HashMap::new();
+        for probe in registry.root_probes() {
+            absent.insert(
+                probe.id.clone(),
+                RootObservation {
+                    probe,
+                    presence: RootPresence::Absent,
+                },
+            );
+        }
+        let retired = registry.record_absent_roots(&absent, 1);
+        let probes = registry.root_probes();
+        assert_eq!(probes.len(), 1, "only one missing root should wait");
+        let deferred = probes[0].id.clone();
+        let present = HashMap::from([(
+            deferred.clone(),
+            RootObservation {
+                probe: probes.into_iter().next().expect("deferred probe"),
+                presence: RootPresence::Present,
+            },
+        )]);
+        assert!(registry.record_absent_roots(&present, 1).is_empty());
+        drop(retired);
+        assert!(registry.take_pending_cleanups().is_empty());
+        assert!(
+            registry
+                .root_probes()
+                .iter()
+                .any(|probe| probe.id == deferred)
+        );
+    }
+
+    #[test]
+    fn deferred_missing_root_revives_when_checkout_moves_but_saved_root_lives() {
+        let registry = WatchRegistry::new();
+        let cfg = Arc::new(Config::default());
+        for index in 0..=MAX_PENDING_CLEANUPS {
+            let name = format!("c{index}");
+            registry.register(
+                ConfigSource::RepoLayer(PathBuf::from(format!(
+                    "/repo-{index}/.hallouminate/config.toml"
+                ))),
+                corpus(&name),
+                cfg.clone(),
+                vec![],
+            );
+        }
+        let mut absent = HashMap::new();
+        for probe in registry.root_probes() {
+            absent.insert(
+                probe.id.clone(),
+                RootObservation {
+                    probe,
+                    presence: RootPresence::Absent,
+                },
+            );
+        }
+        let retired = registry.record_absent_roots(&absent, 1);
+        let probes = registry.root_probes();
+        assert_eq!(probes.len(), 1);
+        let probe = probes.into_iter().next().expect("deferred probe");
+        let id = probe.id.clone();
+        let checkout = HashMap::from([(
+            id.clone(),
+            RootObservation {
+                probe,
+                presence: RootPresence::CheckoutAbsent,
+            },
+        )]);
+        assert!(registry.record_absent_roots(&checkout, 3).is_empty());
+        drop(retired);
+        assert!(registry.take_pending_cleanups().is_empty());
+        assert_eq!(registry.catch_up_state(&id), Some(CatchUpState::Queued));
+        assert_eq!(registry.root_probes().len(), 1);
     }
 
     #[test]
