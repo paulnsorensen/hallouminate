@@ -43,7 +43,7 @@ tracing.workspace = true
 # rust_xlsxwriter require, so the tree holds one zip copy. The 9.0.5 floor
 # excludes the GHSA-m665-v7pm-7grj range. No pure-Rust .xls writer exists, so the
 # .xls path is covered by a detection/routing unit test, not a generated fixture.
-rust_xlsxwriter = "0.102"
+rust_xlsxwriter = "0.103"
 zip = "9.0.5"
 hallouminate-domain.workspace = true
 hallouminate-adapters.workspace = true
