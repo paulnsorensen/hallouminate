@@ -1505,6 +1505,116 @@ ground_dir = "{g}"
     );
 }
 
+async fn ping_until_ready(socket: &Path, cwd: &Path) -> DaemonClient {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Ok(client) = connect_at(socket).await
+            && client
+                .call_raw(DaemonRequest {
+                    cwd: cwd.to_path_buf(),
+                    payload: DaemonRequestPayload::Ping,
+                })
+                .await
+                .is_ok()
+        {
+            return client;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "winning daemon never served {}",
+            socket.display()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_daemon_starts_leave_one_owner_and_losers_exit_cleanly() {
+    const DAEMONS: usize = 4;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cwd = seed_cwd(tmp.path());
+    let socket = tmp.path().join("daemon.sock");
+    let config = tmp.path().join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[embeddings]\nenabled = false\ncache_dir = {cache:?}\n\n[storage]\nground_dir = {ground:?}\n",
+            cache = tmp.path().join("cache").display().to_string(),
+            ground = tmp.path().join("ground").display().to_string(),
+        ),
+    )
+    .expect("write config");
+
+    let mut daemons = tokio::task::JoinSet::new();
+    for _ in 0..DAEMONS {
+        let child = tokio::process::Command::new(env!("CARGO_BIN_EXE_hallouminate"))
+            .arg("daemon")
+            .arg("--config")
+            .arg(&config)
+            .current_dir(&cwd)
+            .env("HALLOUMINATE_SOCKET", &socket)
+            .env("XDG_STATE_HOME", tmp.path().join("state"))
+            .env("XDG_CONFIG_HOME", tmp.path().join("xdg-config"))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn daemon");
+        daemons.spawn(child.wait_with_output());
+    }
+
+    let mut losers = Vec::new();
+    for _ in 1..DAEMONS {
+        let output = timeout(Duration::from_secs(60), daemons.join_next())
+            .await
+            .expect("every losing daemon must exit promptly")
+            .expect("a daemon task remains")
+            .expect("join daemon task")
+            .expect("wait for daemon");
+        losers.push(output);
+    }
+    for output in &losers {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "a losing daemon must exit 0, got {:?}; stderr: {stderr}",
+            output.status
+        );
+        assert!(
+            !stderr.to_lowercase().contains("error"),
+            "a losing daemon must print no error text, got: {stderr}"
+        );
+    }
+
+    let client = ping_until_ready(&socket, &cwd).await;
+    let stopping = client
+        .call_raw(DaemonRequest {
+            cwd: cwd.clone(),
+            payload: DaemonRequestPayload::Shutdown,
+        })
+        .await
+        .expect("shutdown transport ok");
+    match stopping {
+        DaemonResponse::Ok { result } => {
+            assert_eq!(result, serde_json::Value::String("stopping".to_string()));
+        }
+        other => panic!("shutdown must ack `stopping`, got {other:?}"),
+    }
+    let winner = timeout(Duration::from_secs(60), daemons.join_next())
+        .await
+        .expect("the winning daemon must exit after shutdown")
+        .expect("the winning daemon task remains")
+        .expect("join daemon task")
+        .expect("wait for daemon");
+    assert!(
+        winner.status.success(),
+        "the winning daemon must exit 0 after shutdown, got {:?}; stderr: {}",
+        winner.status,
+        String::from_utf8_lossy(&winner.stderr)
+    );
+}
+
 // ─── Curd 1: graceful shutdown ───────────────────────────────────────────
 
 /// Build a tempdir with an empty `.hallouminate/config.toml` so daemon
@@ -5128,9 +5238,97 @@ fn read_schema_version(ground_dir: &Path) -> u32 {
     m.schema_version
 }
 
+#[tokio::test]
+async fn stale_store_refuses_legacy_lock_before_moving_data() {
+    use std::os::unix::fs::MetadataExt;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let corpus_root = tmp.path().join("corpus");
+    std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
+    let stale = hallouminate_adapters::default_schema_version_pub() - 1;
+    write_stale_meta(&ground, stale);
+    let marker = ground.join("owned-data");
+    std::fs::write(&marker, "live owner data").expect("seed owned data");
+    let backup = ground.with_file_name(format!("ground.bak-v{stale}"));
+    std::fs::create_dir_all(&backup).expect("mkdir prior backup");
+    std::fs::write(backup.join("sentinel"), "prior backup").expect("seed backup");
+    let lock_path = ground.join("store.lock");
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .expect("open legacy lock");
+    rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+        .expect("hold legacy lock");
+    let inode = std::fs::metadata(&lock_path).expect("lock metadata").ino();
+
+    let first_socket = tmp.path().join("old-daemon.sock");
+    let second_socket = tmp.path().join("new-daemon.sock");
+    let _first_listener =
+        std::os::unix::net::UnixListener::bind(&first_socket).expect("old daemon socket");
+    let config = tmp.path().join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[[corpus]]\nname = \"docs\"\npaths = [\"{}\"]\nglobs = [\"**/*.md\"]\n\n[storage]\nground_dir = \"{}\"\n\n[embeddings]\nenabled = false\nmodel = \"BAAI/bge-small-en-v1.5\"\n",
+            corpus_root.display(), ground.display()
+        ),
+    )
+    .expect("daemon config");
+    let cwd = seed_cwd(tmp.path());
+    let child = tokio::process::Command::new(env!("CARGO_BIN_EXE_hallouminate"))
+        .arg("daemon")
+        .arg("--config")
+        .arg(&config)
+        .current_dir(&cwd)
+        .env("HALLOUMINATE_SOCKET", &second_socket)
+        .env("XDG_STATE_HOME", tmp.path().join("state"))
+        .env("XDG_CONFIG_HOME", tmp.path().join("xdg-config"))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn second daemon");
+    let output = timeout(Duration::from_secs(10), child.wait_with_output()).await;
+    assert_eq!(
+        std::fs::metadata(&lock_path).expect("active lock").ino(),
+        inode
+    );
+    assert_eq!(
+        std::fs::read_to_string(&marker).expect("active data"),
+        "live owner data"
+    );
+    assert_eq!(read_schema_version(&ground), stale);
+    assert_eq!(
+        std::fs::read_to_string(backup.join("sentinel")).expect("prior backup"),
+        "prior backup"
+    );
+    assert!(!ground.join("store.lock.diagnostics").exists());
+    let output = output
+        .expect("second daemon must refuse promptly")
+        .expect("wait for second daemon");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "second daemon must fail: {stderr}"
+    );
+    assert!(
+        stderr.contains("locked by another hallouminate process"),
+        "lock refusal must identify the owner: {stderr}"
+    );
+    assert!(first_socket.exists());
+    assert!(!second_socket.exists());
+}
+
 // T1: stale store auto-rebuilds
 #[tokio::test]
 async fn stale_store_auto_rebuilds_on_daemon_open() {
+    use std::os::unix::fs::MetadataExt;
+
     // Setup: ground dir with a stale meta.toml (expected - 1) + a seeded wiki
     // file. DaemonState::open must return Ok, moving the stale store aside and
     // reindexing from source.
@@ -5146,6 +5344,12 @@ async fn stale_store_auto_rebuilds_on_daemon_open() {
     let stale = current - 1;
     write_stale_meta(&ground, stale);
 
+    let lock_path = ground.join("store.lock");
+    std::fs::write(&lock_path, "").expect("legacy lock inode");
+    let lock_inode = std::fs::metadata(&lock_path)
+        .expect("legacy lock metadata")
+        .ino();
+
     let cfg = cfg_with_corpus(&ground, &corpus_root);
     // DaemonState::open must succeed (no crash).
     let state = DaemonState::open(cfg, None)
@@ -5157,6 +5361,28 @@ async fn stale_store_auto_rebuilds_on_daemon_open() {
     assert!(
         bak.exists(),
         "backup ground.bak-v{stale} must exist after rebuild"
+    );
+    assert_eq!(
+        std::fs::metadata(&lock_path)
+            .expect("active lock metadata")
+            .ino(),
+        lock_inode,
+        "the active store must retain the legacy lock inode"
+    );
+    assert!(!bak.join("store.lock").exists());
+    assert!(!bak.join("store.lock.diagnostics").exists());
+    let contender = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .expect("active lock path");
+    assert_eq!(
+        rustix::fs::flock(
+            &contender,
+            rustix::fs::FlockOperation::NonBlockingLockExclusive
+        ),
+        Err(rustix::io::Errno::WOULDBLOCK),
+        "a legacy daemon must still see the active store as locked"
     );
     // The backup must contain the original stale meta.toml so the store is
     // recoverable (spec criterion 4: stale store is recoverable at .bak-v{N}).
@@ -5188,6 +5414,208 @@ async fn stale_store_auto_rebuilds_on_daemon_open() {
         std::fs::read_to_string(corpus_root.join("hello.md")).expect("read source"),
         source
     );
+}
+
+struct MigrationKillWriter {
+    output: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    stop_at: &'static str,
+}
+
+impl std::io::Write for MigrationKillWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let mut output = self.output.lock().expect("migration log lock");
+        output.extend_from_slice(bytes);
+        if String::from_utf8_lossy(&output).contains(self.stop_at) {
+            std::process::exit(73);
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn interrupted_boot_config(ground: &Path, first: &Path, later: &Path) -> Config {
+    let mut cfg = cfg_with_corpus(ground, first);
+    cfg.corpora[0].name = "first".into();
+    let mut second = cfg.corpora[0].clone();
+    second.name = "later".into();
+    second.paths = vec![later.to_string_lossy().into_owned()];
+    cfg.corpora.push(second);
+    cfg
+}
+
+#[tokio::test]
+async fn migration_kill_child() {
+    let Ok(ground) = std::env::var("HALLOUMINATE_TEST_KILL_MIGRATION_GROUND") else {
+        return;
+    };
+    let stop_at = match std::env::var("HALLOUMINATE_TEST_KILL_MIGRATION_AT")
+        .expect("kill boundary")
+        .as_str()
+    {
+        "publication" => "moved stale ground store aside",
+        "first_corpus" => "rebuild: reindexed",
+        "file_map" => "file map committed before search indexes",
+        other => panic!("unknown kill boundary: {other}"),
+    };
+    let ground = PathBuf::from(ground);
+    let parent = ground.parent().expect("ground parent");
+    let mut cfg = interrupted_boot_config(&ground, &parent.join("first"), &parent.join("later"));
+    if stop_at == "file_map" {
+        cfg.corpora.truncate(1);
+    }
+    let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let writer_output = std::sync::Arc::clone(&output);
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || MigrationKillWriter {
+            output: std::sync::Arc::clone(&writer_output),
+            stop_at,
+        })
+        .with_ansi(false)
+        .without_time()
+        .with_max_level(tracing::Level::DEBUG)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    DaemonState::open(cfg, None)
+        .await
+        .expect("interrupted boot must reach the selected boundary");
+    panic!("boot returned before kill boundary: {stop_at}");
+}
+
+async fn kill_migration_boot(ground: &Path, stop_at: &str) {
+    let binary = std::env::current_exe().expect("integration test binary");
+    let child = tokio::process::Command::new(binary)
+        .arg("--exact")
+        .arg("daemon::migration_kill_child")
+        .arg("--nocapture")
+        .current_dir(ground.parent().expect("fixture parent"))
+        .kill_on_drop(true)
+        .env("HALLOUMINATE_TEST_KILL_MIGRATION_GROUND", ground)
+        .env("HALLOUMINATE_TEST_KILL_MIGRATION_AT", stop_at)
+        .output();
+    let output = timeout(Duration::from_secs(30), child)
+        .await
+        .expect("migration child timeout")
+        .expect("migration child output");
+    assert_eq!(
+        output.status.code(),
+        Some(73),
+        "child did not stop at {stop_at}: status={:?}; stdout={}; stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+async fn interrupted_boot_recovers(stop_at: &str, interrupt_twice: bool) {
+    use std::os::unix::fs::MetadataExt;
+
+    let tmp = tempfile::tempdir().expect("private migration fixture");
+    let ground = tmp.path().join("ground");
+    let first = tmp.path().join("first");
+    let later = tmp.path().join("later");
+    std::fs::create_dir(&first).expect("first corpus");
+    std::fs::create_dir(&later).expect("later corpus");
+    std::fs::write(first.join("first.md"), "# First\n\nfirst-unique-needle\n")
+        .expect("first source");
+    std::fs::write(
+        later.join("later.md"),
+        "# Later\n\nobscure-arcology-token\n",
+    )
+    .expect("later source");
+    let current = hallouminate_adapters::default_schema_version_pub();
+    let stale = current - 1;
+    write_stale_meta(&ground, stale);
+    kill_migration_boot(&ground, stop_at).await;
+
+    let backup = ground.with_file_name(format!("ground.bak-v{stale}"));
+    let inode = std::fs::metadata(&backup).expect("published backup").ino();
+    assert_eq!(read_schema_version(&backup), stale);
+    match stop_at {
+        "publication" => assert!(
+            !ground.join("meta.toml").exists(),
+            "publication must precede active metadata"
+        ),
+        "first_corpus" => assert_eq!(
+            read_schema_version(&ground),
+            current,
+            "first corpus must follow active metadata"
+        ),
+        other => panic!("unknown kill boundary: {other}"),
+    }
+
+    if interrupt_twice {
+        let aged = std::time::SystemTime::now() - Duration::from_secs(60 * 86_400);
+        std::fs::File::open(&backup)
+            .expect("backup for age test")
+            .set_modified(aged)
+            .expect("age backup before interrupted restart");
+        kill_migration_boot(&ground, "first_corpus").await;
+        assert_eq!(
+            std::fs::metadata(&backup)
+                .expect("backup after second kill")
+                .ino(),
+            inode,
+            "interrupted recovery must not move the backup again"
+        );
+        assert_eq!(read_schema_version(&backup), stale);
+        std::fs::File::open(&backup)
+            .expect("backup for completed recovery")
+            .set_modified(std::time::SystemTime::now())
+            .expect("renew backup age after incomplete restart");
+    }
+
+    let cfg = interrupted_boot_config(&ground, &first, &later);
+    let state = DaemonState::open(cfg, None)
+        .await
+        .expect("resume boot before serving");
+    let key = CorpusKey::from_configured_root("later", later.to_str().expect("later path"));
+    let signals = state
+        .store()
+        .retrieve_signals(&key, "obscure-arcology-token", 10)
+        .await
+        .expect("query rebuilt Lance store");
+    let chunk_id = signals.fts.first().unwrap_or_else(|| {
+        panic!(
+            "later document must be searchable when DaemonState::open returns; stop_at={stop_at}"
+        )
+    });
+    let hit = signals.hits.get(chunk_id).expect("later Markdown hit");
+    assert!(
+        hit.file_ref.ends_with("/later.md"),
+        "wrong result: {}",
+        hit.file_ref
+    );
+    assert_eq!(
+        hit.structure
+            .as_ref()
+            .and_then(|structure| structure.title.as_deref()),
+        Some("Later")
+    );
+    assert_eq!(
+        std::fs::metadata(&backup)
+            .expect("backup after recovery")
+            .ino(),
+        inode,
+        "successful recovery must not publish the backup twice"
+    );
+}
+
+#[tokio::test]
+async fn interrupted_boot_before_metadata_recovers_search() {
+    interrupted_boot_recovers("publication", false).await;
+}
+
+#[tokio::test]
+async fn interrupted_boot_after_metadata_recovers_search() {
+    interrupted_boot_recovers("first_corpus", false).await;
+}
+
+#[tokio::test]
+async fn interrupted_boot_twice_retains_backup_and_recovers_search() {
+    interrupted_boot_recovers("first_corpus", true).await;
 }
 
 // T2: downgrade stays fatal + original store untouched
@@ -5370,6 +5798,109 @@ async fn stale_rebuild_overwrites_prior_backup() {
     );
 }
 
+#[tokio::test]
+async fn stale_rebuild_refuses_working_directory_without_moving_data() {
+    use std::os::unix::fs::MetadataExt;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let corpus = tmp.path().join("corpus");
+    std::fs::create_dir(&corpus).expect("corpus");
+    let stale = hallouminate_adapters::default_schema_version_pub() - 1;
+    write_stale_meta(&ground, stale);
+    let unrelated = ground.join("unrelated.txt");
+    std::fs::write(&unrelated, "keep").expect("unrelated data");
+    let lock = ground.join("store.lock");
+    std::fs::write(&lock, "").expect("legacy lock");
+    let inode = std::fs::metadata(&lock).expect("lock metadata").ino();
+    let config = tmp.path().join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[[corpus]]\nname = \"docs\"\npaths = [\"{}\"]\n\n[storage]\nground_dir = \".\"\n\n[embeddings]\nenabled = false\nmodel = \"BAAI/bge-small-en-v1.5\"\n",
+            corpus.display()
+        ),
+    )
+    .expect("config");
+    let child = tokio::process::Command::new(env!("CARGO_BIN_EXE_hallouminate"))
+        .arg("daemon")
+        .arg("--config")
+        .arg(&config)
+        .current_dir(&ground)
+        .env("HALLOUMINATE_SOCKET", tmp.path().join("daemon.sock"))
+        .env("XDG_STATE_HOME", tmp.path().join("state"))
+        .env("XDG_CONFIG_HOME", tmp.path().join("xdg-config"))
+        .kill_on_drop(true)
+        .output();
+    let output = timeout(Duration::from_secs(10), child)
+        .await
+        .expect("daemon must refuse promptly")
+        .expect("daemon output");
+    assert!(!output.status.success(), "daemon must refuse cwd store");
+    assert_eq!(read_schema_version(&ground), stale);
+    assert_eq!(
+        std::fs::read_to_string(&unrelated).expect("unrelated data"),
+        "keep"
+    );
+    assert_eq!(
+        std::fs::metadata(&lock).expect("lock metadata").ino(),
+        inode
+    );
+    assert!(
+        !ground
+            .with_file_name(format!("ground.bak-v{stale}"))
+            .exists()
+    );
+}
+
+#[tokio::test]
+async fn failed_store_move_preserves_prior_backup_and_active_data() {
+    use std::os::unix::fs::MetadataExt;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let corpus = tmp.path().join("corpus");
+    std::fs::create_dir(&corpus).expect("corpus");
+    let stale = hallouminate_adapters::default_schema_version_pub() - 1;
+    write_stale_meta(&ground, stale);
+    std::fs::create_dir(ground.join("chunks.lance")).expect("managed chunks");
+    let target = tmp.path().join("target");
+    std::fs::write(&target, "do not follow").expect("target");
+    std::os::unix::fs::symlink(&target, ground.join("root_files.lance"))
+        .expect("blocking managed symlink");
+    let unrelated = ground.join("unrelated.txt");
+    std::fs::write(&unrelated, "keep").expect("unrelated data");
+    let backup = ground.with_file_name(format!("ground.bak-v{stale}"));
+    std::fs::create_dir(&backup).expect("prior backup");
+    std::fs::write(backup.join("sentinel"), "prior").expect("sentinel");
+    let lock = ground.join("store.lock");
+    std::fs::write(&lock, "").expect("legacy lock");
+    let inode = std::fs::metadata(&lock).expect("lock metadata").ino();
+    let error = DaemonState::open(cfg_with_corpus(&ground, &corpus), None)
+        .await
+        .expect_err("unsafe managed entry must stop migration");
+    assert!(error.to_string().contains("symlink"), "{error:#}");
+    assert_eq!(read_schema_version(&ground), stale);
+    assert!(ground.join("chunks.lance").is_dir());
+    assert_eq!(
+        std::fs::read_to_string(&unrelated).expect("unrelated data"),
+        "keep"
+    );
+    assert_eq!(
+        std::fs::read_to_string(backup.join("sentinel")).expect("prior"),
+        "prior"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&target).expect("target"),
+        "do not follow"
+    );
+    assert_eq!(
+        std::fs::metadata(&lock).expect("lock metadata").ino(),
+        inode
+    );
+    assert!(!ground.join(".migration-stage").exists());
+}
+
 // T6: rebuild failure — Err returned, backup preserved
 #[tokio::test]
 async fn stale_v3_daemon_startup_failure_warns_and_preserves_backup() {
@@ -5413,7 +5944,7 @@ async fn stale_v3_daemon_startup_failure_warns_and_preserves_backup() {
         logs.contains_event(
             tracing::Level::WARN,
             &[
-                "rebuild failed; removed partial ground dir",
+                "rebuild failed; removed partial ground data",
                 "Backup preserved",
             ]
         ),
@@ -5430,9 +5961,16 @@ async fn stale_v3_daemon_startup_failure_warns_and_preserves_backup() {
         "stale store backup must be preserved after failed rebuild"
     );
     assert_eq!(read_schema_version(&backup), 3);
-    assert!(
-        !ground.exists(),
-        "partial fresh ground dir must be removed on rebuild failure"
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(&ground).expect("active guard directory") {
+        let entry = entry.expect("guard entry");
+        names.push(entry.file_name().to_str().expect("guard name").to_owned());
+    }
+    names.sort();
+    assert_eq!(
+        names,
+        ["store.lock", "store.lock.diagnostics"],
+        "failed rebuild must leave only the shared lock guards"
     );
 }
 
@@ -6139,4 +6677,190 @@ model = "BAAI/bge-small-en-v1.5"
     // warm, shallow, deep, and the four index.md files (root, a, a/b, a/b/c).
     assert_eq!(stats.indexed_files, 7);
     assert_eq!(stats.unindexed_files, 0);
+}
+
+#[tokio::test]
+async fn interrupted_boot_after_file_map_restores_ranked_search_without_new_content() {
+    use std::os::unix::fs::MetadataExt;
+
+    let tmp = tempfile::tempdir().expect("private migration fixture");
+    let ground = tmp.path().join("ground");
+    let first = tmp.path().join("first");
+    std::fs::create_dir(&first).expect("first corpus");
+    std::fs::write(first.join("first.md"), "# First\n\nfirst-unique-needle\n")
+        .expect("first source");
+    let current = hallouminate_adapters::default_schema_version_pub();
+    let stale = current - 1;
+    write_stale_meta(&ground, stale);
+    kill_migration_boot(&ground, "file_map").await;
+
+    let backup = ground.with_file_name(format!("ground.bak-v{stale}"));
+    let inode = std::fs::metadata(&backup).expect("published backup").ino();
+    let mut cfg = interrupted_boot_config(&ground, &first, &tmp.path().join("later"));
+    cfg.corpora.truncate(1);
+    cfg.daemon.maintenance_interval_secs = 0;
+    let key = CorpusKey::from_configured_root("first", first.to_str().expect("first path"));
+    let interrupted = LanceStore::open_or_create(
+        &ground,
+        &cfg.embeddings.model,
+        cfg.embeddings.quantized,
+        cfg.embeddings.enabled,
+        None,
+    )
+    .await
+    .expect("inspect interrupted store");
+    assert_eq!(interrupted.count_rows().await.expect("content rows"), 1);
+    let mapped = interrupted.list_files(&key).await.expect("file mapping");
+    assert_eq!(mapped.len(), 1);
+    assert!(mapped[0].file_ref.ends_with("/first.md"));
+    assert!(
+        interrupted
+            .retrieve_signals(&key, "first-unique-needle", 10)
+            .await
+            .expect("ranked retrieval before recovery")
+            .fts
+            .is_empty(),
+        "interrupted store must not have an FTS index"
+    );
+    drop(interrupted);
+
+    let state = DaemonState::open(cfg, None)
+        .await
+        .expect("resume boot before serving");
+    assert_eq!(state.store().count_rows().await.expect("recovered rows"), 1);
+    assert_eq!(
+        state
+            .store()
+            .list_files(&key)
+            .await
+            .expect("recovered mapping"),
+        mapped,
+        "unchanged recovery must retain the original file map"
+    );
+    let signals = state
+        .store()
+        .retrieve_signals(&key, "first-unique-needle", 10)
+        .await
+        .expect("ranked retrieval after recovery");
+    let chunk_id = signals
+        .fts
+        .first()
+        .expect("FTS hit after unchanged recovery");
+    let hit = signals.hits.get(chunk_id).expect("mapped Markdown hit");
+    assert!(hit.file_ref.ends_with("/first.md"));
+    assert_eq!(
+        hit.structure
+            .as_ref()
+            .and_then(|structure| structure.title.as_deref()),
+        Some("First")
+    );
+    assert_eq!(
+        std::fs::metadata(&backup)
+            .expect("backup after recovery")
+            .ino(),
+        inode
+    );
+}
+
+#[tokio::test]
+async fn interrupted_empty_boot_recovers_without_search_indexes() {
+    use std::os::unix::fs::MetadataExt;
+
+    let tmp = tempfile::tempdir().expect("private migration fixture");
+    let ground = tmp.path().join("ground");
+    let first = tmp.path().join("first");
+    std::fs::create_dir(&first).expect("empty corpus");
+    let stale = hallouminate_adapters::default_schema_version_pub() - 1;
+    write_stale_meta(&ground, stale);
+    kill_migration_boot(&ground, "publication").await;
+    let backup = ground.with_file_name(format!("ground.bak-v{stale}"));
+    let inode = std::fs::metadata(&backup).expect("published backup").ino();
+
+    let mut cfg = cfg_with_corpus(&ground, &first);
+    cfg.daemon.maintenance_interval_secs = 0;
+    let state = DaemonState::open(cfg, None)
+        .await
+        .expect("empty pending rebuild must complete");
+    assert_eq!(state.store().count_rows().await.expect("empty rows"), 0);
+    let key = CorpusKey::from_configured_root("docs", first.to_str().expect("first path"));
+    assert!(
+        state
+            .store()
+            .retrieve_signals(&key, "absent", 10)
+            .await
+            .expect("empty ranked retrieval")
+            .fts
+            .is_empty()
+    );
+    assert!(!ground.join(".migration-rebuild").exists());
+    assert_eq!(std::fs::metadata(&backup).expect("backup").ino(), inode);
+}
+
+#[tokio::test]
+async fn failed_required_index_finalization_keeps_pending_backup_for_retry() {
+    use std::os::unix::fs::MetadataExt;
+
+    let tmp = tempfile::tempdir().expect("private migration fixture");
+    let ground = tmp.path().join("ground");
+    let first = tmp.path().join("first");
+    std::fs::create_dir(&first).expect("first corpus");
+    std::fs::write(first.join("first.md"), "# First\n\nfirst-unique-needle\n")
+        .expect("first source");
+    let stale = hallouminate_adapters::default_schema_version_pub() - 1;
+    write_stale_meta(&ground, stale);
+    kill_migration_boot(&ground, "file_map").await;
+
+    let backup = ground.with_file_name(format!("ground.bak-v{stale}"));
+    let aged = std::time::SystemTime::now() - Duration::from_secs(60 * 86_400);
+    std::fs::File::open(&backup)
+        .expect("backup for age test")
+        .set_modified(aged)
+        .expect("age backup before failed recovery");
+    let backup_metadata = std::fs::metadata(&backup).expect("published backup");
+    let pending = ground.join(".migration-rebuild");
+    let receipt = std::fs::read(&pending).expect("pending receipt");
+    let collision = ground.join("chunks.lance/_indices");
+    assert!(!collision.exists(), "interrupted store must lack indexes");
+    std::fs::write(&collision, "block required index creation")
+        .expect("create real index path collision");
+
+    let mut cfg = interrupted_boot_config(&ground, &first, &tmp.path().join("later"));
+    cfg.corpora.truncate(1);
+    cfg.daemon.maintenance_interval_secs = 0;
+    let error = DaemonState::open(cfg.clone(), None)
+        .await
+        .expect_err("required index failure must reject boot");
+    assert!(
+        format!("{error:#}").contains("rebuild: finalize search indexes"),
+        "wrong recovery failure: {error:#}"
+    );
+    assert_eq!(std::fs::read(&pending).expect("pending receipt"), receipt);
+    let retained = std::fs::metadata(&backup).expect("retained backup");
+    assert_eq!(retained.ino(), backup_metadata.ino());
+    assert_eq!(
+        retained.modified().expect("retained age"),
+        backup_metadata.modified().expect("initial age")
+    );
+    assert_eq!(read_schema_version(&backup), stale);
+    std::fs::File::open(&backup)
+        .expect("backup for completed recovery")
+        .set_modified(std::time::SystemTime::now())
+        .expect("renew backup age before retry");
+
+    let state = DaemonState::open(cfg, None)
+        .await
+        .expect("retry rebuild after partial reset");
+    let key = CorpusKey::from_configured_root("first", first.to_str().expect("first path"));
+    let signals = state
+        .store()
+        .retrieve_signals(&key, "first-unique-needle", 10)
+        .await
+        .expect("ranked retrieval after retry");
+    assert!(!signals.fts.is_empty(), "retry must restore FTS");
+    assert_eq!(
+        std::fs::metadata(&backup)
+            .expect("backup after retry")
+            .ino(),
+        backup_metadata.ino()
+    );
 }

@@ -63,10 +63,11 @@ so the wiki lands at `<repo>/.hallouminate/wiki` and is searchable as
 
 ## Logging
 
-The active process log is
-`$XDG_STATE_HOME/hallouminate/hallouminate.log` (default
-`~/.local/state/hallouminate/hallouminate.log`). Size rotation creates
-numbered archives `hallouminate.log.1`, `.2`, and so on, with `.1` newest.
+The active process log uses the build channel's app directory:
+`$XDG_STATE_HOME/hallouminate/hallouminate.log` for release builds and
+`$XDG_STATE_HOME/hallouminate-dev/hallouminate.log` for dev builds.
+When `XDG_STATE_HOME` is unset, the base is `~/.local/state`.
+Size rotation creates numbered archives `hallouminate.log.1`, `.2`, and so on, with `.1` newest.
 
 ```toml
 [logging]
@@ -144,3 +145,71 @@ hallouminate config download
 | Ground (LanceDB) directory | `~/.local/share/hallouminate/ground` |
 | Model cache | `~/.cache/hallouminate/fastembed` |
 | Daemon socket | `<account-home>/.cache/hallouminate/daemon.sock` |
+| Daemon bootstrap log | `$XDG_STATE_HOME/hallouminate/daemon-bootstrap.log` |
+
+These are the defaults for a release build. A dev build uses other
+defaults, as the next section shows.
+
+## Release builds and dev builds
+
+A release build and a dev build never share a default store or daemon.
+This stops a dev build from migrating the store of an installed release.
+
+A build is a release build when one of these conditions is true at compile
+time:
+
+- The build sets `HALLOUMINATE_RELEASE_CHANNEL` to a non-empty value. The
+  nightly workflow (`@paulnsorensen/hallouminate-nightly` on npm) sets it to
+  `nightly`. The tag release workflow (shell installer and the
+  `hallouminate` npm package) sets it to `stable`.
+- The source comes from a published crates.io package, for example
+  `cargo install hallouminate`. The `hallouminate-config` build script
+  detects the `.cargo_vcs_info.json` file that `cargo package` writes.
+
+All other builds are dev builds. Examples are `cargo build` or `cargo test`
+in a checkout or worktree, and `cargo install --path`. A release profile
+does not make a build a release build.
+
+Packagers: `cargo install --git`, `cargo install --path`, and distro or Nix
+builds from a git tarball are dev builds. Set `HALLOUMINATE_RELEASE_CHANNEL`
+at build time to make them release builds.
+
+`hallouminate --version` prints the channel after the version, for example
+`hallouminate 0.12.2 (stable)`. A dev build prints `(dev)`.
+
+A dev build replaces the `hallouminate` directory name with
+`hallouminate-dev` in these defaults:
+
+| What | Release build | Dev build |
+|---|---|---|
+| Ground (LanceDB) directory | `~/.local/share/hallouminate/ground` | `~/.local/share/hallouminate-dev/ground` |
+| Daemon socket | `<account-home>/.cache/hallouminate/daemon.sock` | `<account-home>/.cache/hallouminate-dev/daemon.sock` |
+| Daemon bootstrap log | `$XDG_STATE_HOME/hallouminate/daemon-bootstrap.log` | `$XDG_STATE_HOME/hallouminate-dev/daemon-bootstrap.log` |
+
+The watchdog trip file is next to the socket, so it also moves.
+
+These items do not change:
+
+- Both builds read the same baseline config,
+  `$XDG_CONFIG_HOME/hallouminate/config.toml`.
+- Both builds share the model cache, `~/.cache/hallouminate/fastembed`.
+  Model files are immutable downloads and have no store schema.
+- Explicit `[embeddings].cache_dir` and `HALLOUMINATE_SOCKET` settings win.
+  An intentional custom `[storage].ground_dir` also stays unchanged.
+  A dev build remaps the legacy built-in release `ground_dir` default to its
+  dev directory, whether the path uses `~` or an expanded home directory.
+- `XDG_STATE_HOME` sets only the state directory base. The build channel
+  selects `hallouminate` or `hallouminate-dev` below that base, including
+  the active process log.
+
+The first dev build on a host starts with an empty store. Run
+`hallouminate index` to fill it.
+
+## Daemon socket path length
+
+A Unix socket path must fit in `sockaddr_un.sun_path`, including the
+trailing NUL. The limit is 108 bytes on Linux and 104 bytes on macOS. The
+daemon and its clients check the resolved socket path before they use it.
+A path that is too long stops the command with an error that names its
+source and the limit. An explicit `--socket` path error names `--socket`;
+an environment override error names `HALLOUMINATE_SOCKET`.

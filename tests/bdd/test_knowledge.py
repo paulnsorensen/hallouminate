@@ -116,8 +116,8 @@ def duplicate(app: Application, client: Mcp, story: dict[str, Any]) -> None:
 @then("the second daemon exits and the first client still reads its page")
 def duplicate_rejected(app: Application, client: Mcp, story: dict[str, Any]) -> None:
     result = story["duplicate"]
-    assert result.returncode != 0, result
-    assert "already holds" in result.stderr, result
+    assert result.returncode == 0, result
+    assert "error" not in result.stderr.lower(), result
     assert read(app, client, corpus=CORPUS) == OLD
     assert found(app, client, "cobaltbeacon") == [PATH]
 

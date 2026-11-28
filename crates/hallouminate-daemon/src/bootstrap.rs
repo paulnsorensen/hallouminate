@@ -80,11 +80,7 @@ pub async fn ensure_daemon_running() -> anyhow::Result<()> {
     // anything emitted before the subscriber installs (panics, early
     // config errors) and is the fallback diagnostic when the daemon
     // refuses to come up.
-    let log_path = hallouminate_config::xdg::xdg_path(
-        "XDG_STATE_HOME",
-        "~/.local/state",
-        &["hallouminate", "daemon-bootstrap.log"],
-    );
+    let log_path = hallouminate_config::xdg::state_dir().join("daemon-bootstrap.log");
     if let Some(dir) = log_path.parent() {
         std::fs::create_dir_all(dir)?;
     }

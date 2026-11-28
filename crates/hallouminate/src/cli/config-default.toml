@@ -64,7 +64,8 @@ failure_reminder_secs = 60
 catch_up_concurrency = 4
 
 [storage]
-ground_dir = "~/.local/share/hallouminate/ground"
+# Defaults to ~/.local/share/hallouminate/ground (dev builds: hallouminate-dev).
+# ground_dir = "~/.local/share/hallouminate/ground"
 
 # Repo-layer `[[corpus]]` and `[[repository]]` paths must stay inside the repo
 # root. A path outside it (after symlink resolution) is skipped with a

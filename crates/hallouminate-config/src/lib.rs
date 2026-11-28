@@ -1,3 +1,4 @@
+pub mod channel;
 pub mod xdg;
 use std::path::{Path, PathBuf};
 
@@ -25,7 +26,6 @@ const DEFAULT_RECONCILE_INTERVAL_SECS: u64 = 60;
 const DEFAULT_MAX_LOG_FILE_BYTES: u64 = 10 * 1024 * 1024;
 const DEFAULT_MAX_LOG_TOTAL_BYTES: u64 = 100 * 1024 * 1024;
 const DEFAULT_EMBED_CACHE: &str = "~/.cache/hallouminate/fastembed";
-const DEFAULT_GROUND_DIR: &str = "~/.local/share/hallouminate/ground";
 // #139: crossencoder rerank timeout, configurable via `[search].rerank_timeout_ms`.
 // 2s covers the measured ~1.25s median rerank for the default N=50 candidate
 // pool — see `domain::search::crossencoder` for the latency rationale.
@@ -108,7 +108,8 @@ pub struct EmbeddingsConfig {
     #[serde(default)]
     pub quantized: bool,
     /// Directory where fastembed caches downloaded model files
-    /// (default `~/.cache/hallouminate/fastembed`).
+    /// (default `~/.cache/hallouminate/fastembed`). Release and dev builds
+    /// share it: model files are immutable downloads with no store schema.
     #[serde(default = "default_embed_cache")]
     pub cache_dir: String,
     /// Deprecated — does nothing. Session eviction was removed (ADR-001):
@@ -337,7 +338,8 @@ impl Default for DaemonConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StorageConfig {
     /// Directory holding the ground (markdown wiki) store
-    /// (default `~/.local/share/hallouminate/ground`).
+    /// (default `~/.local/share/hallouminate/ground` for a release build and
+    /// `~/.local/share/hallouminate-dev/ground` for any other build).
     #[serde(default = "default_ground_dir")]
     pub ground_dir: String,
 }
@@ -345,7 +347,7 @@ pub struct StorageConfig {
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
-            ground_dir: DEFAULT_GROUND_DIR.into(),
+            ground_dir: default_ground_dir(),
         }
     }
 }
@@ -1440,6 +1442,10 @@ fn parse(text: &str, source: Option<&Path>) -> Result<Config> {
 }
 
 fn normalize(cfg: &mut Config) -> Result<()> {
+    cfg.storage.ground_dir = isolate_dev_ground_dir(
+        channel::BUILD_CHANNEL,
+        std::mem::take(&mut cfg.storage.ground_dir),
+    );
     cfg.embeddings.model = canonical_model_name(&cfg.embeddings.model)?.to_string();
     Ok(())
 }
@@ -1628,7 +1634,25 @@ fn default_idle_evict_secs() -> u64 {
     300
 }
 fn default_ground_dir() -> String {
-    DEFAULT_GROUND_DIR.into()
+    ground_dir_for(channel::BUILD_CHANNEL)
+}
+fn ground_dir_for(channel: channel::BuildChannel) -> String {
+    format!("~/.local/share/{}/ground", channel.app_dir())
+}
+/// Old config templates wrote the release ground directory explicitly. A dev
+/// build treats that value as unset so it never opens the release store.
+fn isolate_dev_ground_dir(channel: channel::BuildChannel, ground_dir: String) -> String {
+    match channel {
+        channel::BuildChannel::Release => ground_dir,
+        channel::BuildChannel::Dev => {
+            let release = ground_dir_for(channel::BuildChannel::Release);
+            if ground_dir == release || expand_tilde(&ground_dir) == expand_tilde(&release) {
+                ground_dir_for(channel::BuildChannel::Dev)
+            } else {
+                ground_dir
+            }
+        }
+    }
 }
 fn default_idle_exit_secs() -> u64 {
     900
@@ -1823,7 +1847,10 @@ ground_dir = "~/.local/share/hallouminate/ground"
         assert_eq!(cfg.embeddings.cache_dir, "~/.cache/hallouminate/fastembed");
 
         assert_eq!(cfg.watch.debounce_ms, 500);
-        assert_eq!(cfg.storage.ground_dir, "~/.local/share/hallouminate/ground");
+        assert_eq!(
+            cfg.storage.ground_dir,
+            ground_dir_for(channel::BUILD_CHANNEL)
+        );
     }
 
     #[test]
@@ -4070,7 +4097,7 @@ path = "."
         );
         assert!(!msg.contains("set by baseline"), "got: {msg}");
         assert!(
-            msg.contains("active = \"~/.local/share/hallouminate/ground\""),
+            msg.contains(&format!("active = \"{}\"", default_ground_dir())),
             "got: {msg}"
         );
         assert!(
@@ -4129,5 +4156,101 @@ path = "."
                 "got: {msg}"
             );
         }
+    }
+
+    #[test]
+    fn release_channel_keeps_the_installed_default_paths() {
+        assert_eq!(
+            ground_dir_for(channel::BuildChannel::Release),
+            "~/.local/share/hallouminate/ground"
+        );
+    }
+
+    #[test]
+    fn dev_channel_defaults_differ_from_release_defaults() {
+        assert_eq!(
+            ground_dir_for(channel::BuildChannel::Dev),
+            "~/.local/share/hallouminate-dev/ground"
+        );
+    }
+
+    #[test]
+    fn compiled_defaults_follow_the_build_channel() {
+        let cfg = parse("", None).expect("defaults");
+        assert_eq!(cfg, Config::default());
+        let release_ground = ground_dir_for(channel::BuildChannel::Release);
+        match channel::BUILD_CHANNEL {
+            channel::BuildChannel::Release => assert_eq!(cfg.storage.ground_dir, release_ground),
+            channel::BuildChannel::Dev => assert_ne!(cfg.storage.ground_dir, release_ground),
+        }
+        assert_eq!(cfg.embeddings.cache_dir, "~/.cache/hallouminate/fastembed");
+    }
+
+    #[test]
+    fn explicit_storage_paths_win_over_channel_defaults() {
+        let cfg = parse(
+            "[storage]\nground_dir = \"/explicit/ground\"\n[embeddings]\ncache_dir = \"/explicit/cache\"\n",
+            None,
+        )
+        .expect("explicit paths");
+        assert_eq!(cfg.storage.ground_dir, "/explicit/ground");
+        assert_eq!(cfg.embeddings.cache_dir, "/explicit/cache");
+    }
+
+    #[test]
+    fn old_template_ground_dir_follows_the_build_channel() {
+        let expanded = expand_tilde(&ground_dir_for(channel::BuildChannel::Release));
+        let expanded = expanded.to_string_lossy();
+        for written in [
+            ground_dir_for(channel::BuildChannel::Release),
+            expanded.into_owned(),
+        ] {
+            let cfg = parse(&format!("[storage]\nground_dir = \"{written}\"\n"), None)
+                .expect("old template ground_dir");
+            assert_eq!(
+                cfg.storage.ground_dir,
+                ground_dir_for(channel::BUILD_CHANNEL),
+                "written as {written}"
+            );
+        }
+    }
+
+    #[test]
+    fn repo_layer_legacy_ground_dir_follows_the_build_channel() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo_root = canon(dir.path());
+        write_repo_config(
+            &repo_root,
+            "[storage]\nground_dir = \"~/.local/share/hallouminate/ground\"\n",
+        );
+
+        let (effective, layers) =
+            resolve_for_cwd(&Config::default(), &repo_root, None).expect("resolve legacy config");
+        assert_eq!(
+            layers.repo_path,
+            Some(repo_root.join(".hallouminate/config.toml"))
+        );
+        assert_eq!(
+            effective.storage.ground_dir,
+            ground_dir_for(channel::BUILD_CHANNEL)
+        );
+    }
+
+    #[test]
+    fn dev_build_redirects_only_the_release_ground_dir() {
+        let release = ground_dir_for(channel::BuildChannel::Release);
+        let dev = ground_dir_for(channel::BuildChannel::Dev);
+        assert_eq!(
+            isolate_dev_ground_dir(channel::BuildChannel::Dev, release.clone()),
+            dev
+        );
+        assert_eq!(
+            isolate_dev_ground_dir(channel::BuildChannel::Release, release.clone()),
+            release
+        );
+        assert_eq!(
+            isolate_dev_ground_dir(channel::BuildChannel::Dev, "/explicit/ground".into()),
+            "/explicit/ground"
+        );
     }
 }

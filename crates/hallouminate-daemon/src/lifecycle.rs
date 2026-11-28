@@ -14,6 +14,7 @@ use tokio::net::UnixStream;
 use super::bootstrap::ensure_daemon_running;
 use super::client::connect_at;
 use super::ipc::{DaemonRequest, DaemonRequestPayload, DaemonResponse, StatusReport};
+use super::server::{InstanceLock, acquire_single_instance, lock_path_for};
 use super::socket::daemon_socket_path;
 
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -94,13 +95,40 @@ pub(super) async fn stop_at(socket: &Path) -> anyhow::Result<()> {
 
     loop {
         if !socket.exists() || UnixStream::connect(socket).await.is_err() {
-            return Ok(());
+            return wait_for_lock_release(socket, deadline).await;
         }
         if std::time::Instant::now() >= deadline {
             anyhow::bail!(
                 "daemon did not stop within {}s (socket {} still reachable)",
                 STOP_TIMEOUT.as_secs(),
                 socket.display(),
+            );
+        }
+        tokio::time::sleep(STOP_POLL).await;
+    }
+}
+
+/// Wait until the startup lock next to `socket` is free. The old daemon
+/// drops the socket before it drops the lock, and a daemon that starts
+/// while the lock is held exits quietly.
+async fn wait_for_lock_release(socket: &Path, deadline: std::time::Instant) -> anyhow::Result<()> {
+    let lock_path = lock_path_for(socket);
+    loop {
+        if !lock_path.exists() {
+            return Ok(());
+        }
+        match acquire_single_instance(&lock_path)? {
+            InstanceLock::Acquired(lock) => {
+                drop(lock);
+                return Ok(());
+            }
+            InstanceLock::HeldByAnother => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "daemon did not stop within {}s (lock {} still held)",
+                STOP_TIMEOUT.as_secs(),
+                lock_path.display(),
             );
         }
         tokio::time::sleep(STOP_POLL).await;
@@ -220,6 +248,55 @@ mod tests {
         stop_at(&socket).await.expect("stop");
 
         assert!(!socket.exists(), "socket must be removed");
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn stop_waits_for_the_startup_lock_to_release() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("daemon.sock");
+        let InstanceLock::Acquired(lock) =
+            acquire_single_instance(&lock_path_for(&socket)).expect("daemon lock")
+        else {
+            panic!("first daemon must acquire the lock");
+        };
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind socket");
+        let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let released_by_server = released.clone();
+        let socket_for_server = socket.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.expect("accept");
+                let (read_half, mut write_half) = stream.into_split();
+                let mut reader = tokio::io::BufReader::new(read_half);
+                let mut line = String::new();
+                reader.read_line(&mut line).await.expect("read request");
+                if line.is_empty() {
+                    continue;
+                }
+                let mut response =
+                    serde_json::to_string(&DaemonResponse::ok(&"stopping")).expect("serialize");
+                response.push('\n');
+                write_half
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write response");
+                drop(write_half);
+                drop(listener);
+                std::fs::remove_file(&socket_for_server).expect("remove socket");
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            released_by_server.store(true, std::sync::atomic::Ordering::SeqCst);
+            drop(lock);
+        });
+
+        stop_at(&socket).await.expect("stop");
+
+        assert!(
+            released.load(std::sync::atomic::Ordering::SeqCst),
+            "stop must not return while the old daemon holds the startup lock"
+        );
         server.await.expect("server task");
     }
 }

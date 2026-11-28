@@ -54,8 +54,9 @@ const MAX_CONCURRENT_CONNECTIONS: usize = 64;
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Boot the daemon and serve until SIGINT/SIGTERM (or stdin close on the
-/// rare debug invocations). Returns `Err` if another daemon is already
-/// holding the single-instance lock on the configured socket directory.
+/// rare debug invocations). Returns `Ok` without serving when another daemon
+/// already holds the single-instance lock on the configured socket: the
+/// caller polls that socket, so losing the start race is not a failure.
 ///
 /// The Tokio runtime must use the multi-thread scheduler because request
 /// handlers use `block_in_place` for synchronous index and storage work.
@@ -115,7 +116,17 @@ async fn serve_with_config(
     }
     prepare_socket_dir(socket_path).await?;
     let lock_path = lock_path_for(socket_path);
-    let lock = acquire_single_instance(&lock_path)?;
+    let lock = match acquire_single_instance(&lock_path)? {
+        InstanceLock::Acquired(lock) => lock,
+        InstanceLock::HeldByAnother => {
+            tracing::info!(
+                target: "hallouminate::daemon",
+                lock = %lock_path.display(),
+                "another hallouminate daemon holds the single-instance lock; exiting",
+            );
+            return Ok(());
+        }
+    };
     let state = DaemonState::open_with_socket(cfg, xdg_path, socket_path.to_path_buf()).await?;
     remove_stale_socket(socket_path).await;
     // One-shot probe to learn whether the watcher backend is enabled. Stop and
@@ -477,6 +488,9 @@ pub async fn serve(state: &DaemonState, socket_path: &Path) -> anyhow::Result<()
 /// so integration tests can exercise the timeout behavior without waiting
 /// out the real 30s default.
 ///
+/// Unlike `serve_with_config`, which exits quietly with `Ok` when another
+/// daemon holds the startup lock, this returns an error in that case.
+///
 /// The Tokio runtime must use the multi-thread scheduler because request
 /// handlers use `block_in_place` for synchronous index and storage work.
 pub async fn serve_with_idle_timeout(
@@ -486,7 +500,13 @@ pub async fn serve_with_idle_timeout(
 ) -> anyhow::Result<()> {
     prepare_socket_dir(socket_path).await?;
     let lock_path = lock_path_for(socket_path);
-    let lock = acquire_single_instance(&lock_path)?;
+    let lock = match acquire_single_instance(&lock_path)? {
+        InstanceLock::Acquired(lock) => lock,
+        InstanceLock::HeldByAnother => anyhow::bail!(
+            "another hallouminate daemon already holds {}",
+            lock_path.display()
+        ),
+    };
     // Stale socket cleanup. If a previous daemon crashed without removing
     // its socket, the next bind would fail with EADDRINUSE. Holding the
     // flock above guarantees only one daemon is alive, so removing the
@@ -768,21 +788,27 @@ fn idle_clock_for_response(
     }
 }
 
-fn lock_path_for(socket_path: &Path) -> PathBuf {
+pub(super) fn lock_path_for(socket_path: &Path) -> PathBuf {
     let mut s = socket_path.as_os_str().to_os_string();
     s.push(".lock");
     PathBuf::from(s)
 }
 
+pub(super) enum InstanceLock {
+    Acquired(std::fs::File),
+    HeldByAnother,
+}
+
 /// Take a non-blocking advisory lock on the lockfile next to the socket.
-/// Returns the open file; closing the fd releases the advisory lock
-/// (POSIX). A second daemon on the same socket bounces with `EWOULDBLOCK`
-/// and surfaces a clear "daemon already running" error.
-fn acquire_single_instance(lock_path: &Path) -> anyhow::Result<std::fs::File> {
+/// The acquired file holds the lock; closing the fd releases it (POSIX). A
+/// second daemon on the same socket sees `EWOULDBLOCK` and gets
+/// `HeldByAnother`. Any other open or lock failure is an error.
+pub(super) fn acquire_single_instance(lock_path: &Path) -> anyhow::Result<InstanceLock> {
     use std::fs::OpenOptions;
     use std::os::unix::fs::OpenOptionsExt;
 
     use rustix::fs::{FlockOperation, flock};
+    use rustix::io::Errno;
 
     let file = OpenOptions::new()
         .read(true)
@@ -792,14 +818,17 @@ fn acquire_single_instance(lock_path: &Path) -> anyhow::Result<std::fs::File> {
         .mode(0o600)
         .open(lock_path)
         .map_err(|e| anyhow::anyhow!("open lockfile {}: {e}", lock_path.display()))?;
-    if let Err(errno) = flock(&file, FlockOperation::NonBlockingLockExclusive) {
-        return Err(anyhow::anyhow!(
-            "another hallouminate daemon already holds {} ({})",
-            lock_path.display(),
-            std::io::Error::from(errno)
-        ));
+    let Err(errno) = flock(&file, FlockOperation::NonBlockingLockExclusive) else {
+        return Ok(InstanceLock::Acquired(file));
+    };
+    if errno == Errno::WOULDBLOCK {
+        return Ok(InstanceLock::HeldByAnother);
     }
-    Ok(file)
+    Err(anyhow::anyhow!(
+        "lock {}: {}",
+        lock_path.display(),
+        std::io::Error::from(errno)
+    ))
 }
 
 /// Reject mutating requests (`AddMarkdown`/`DeleteMarkdown`/`Index`/
@@ -1288,11 +1317,14 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             match acquire_single_instance(lock_path) {
-                Ok(file) => return file,
-                Err(e) if Instant::now() >= deadline => {
-                    panic!("replacement daemon never acquired released lock: {e}")
+                Ok(InstanceLock::Acquired(file)) => return file,
+                Ok(InstanceLock::HeldByAnother) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(1))
                 }
-                Err(_) => std::thread::sleep(Duration::from_millis(1)),
+                Ok(InstanceLock::HeldByAnother) => {
+                    panic!("replacement daemon never acquired released lock")
+                }
+                Err(e) => panic!("lock attempt failed: {e:#}"),
             }
         }
     }
@@ -1302,7 +1334,11 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let socket_path = tmp.path().join("daemon.sock");
         let lock_path = lock_path_for(&socket_path);
-        let lock = acquire_single_instance(&lock_path).expect("first daemon lock");
+        let InstanceLock::Acquired(lock) =
+            acquire_single_instance(&lock_path).expect("first daemon lock")
+        else {
+            panic!("first daemon must acquire the lock");
+        };
         let (release, wait_for_release) = tokio::sync::oneshot::channel::<()>();
         let maintenance = tokio::spawn(async move {
             wait_for_release.await.expect("release maintenance");
@@ -1319,10 +1355,12 @@ mod tests {
         });
 
         tokio::task::yield_now().await;
-        assert!(
-            acquire_single_instance(&lock_path).is_err(),
-            "replacement daemon must not acquire the lock while maintenance is running",
-        );
+        match acquire_single_instance(&lock_path).expect("lock attempt") {
+            InstanceLock::HeldByAnother => {}
+            InstanceLock::Acquired(_) => {
+                panic!("replacement daemon must not acquire the lock while maintenance is running")
+            }
+        }
 
         release.send(()).expect("finish maintenance");
         shutdown.await.expect("finish shutdown");

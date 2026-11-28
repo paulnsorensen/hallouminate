@@ -115,7 +115,7 @@ fn reap_legacy_dated_log(entry: std::fs::DirEntry) -> std::io::Result<()> {
 }
 
 fn state_dir() -> PathBuf {
-    hallouminate_config::xdg::xdg_path("XDG_STATE_HOME", "~/.local/state", &["hallouminate"])
+    hallouminate_config::xdg::state_dir()
 }
 
 #[cfg(test)]
@@ -129,8 +129,8 @@ mod tests {
     fn state_dir_ends_under_hallouminate_subdir() {
         let dir = state_dir();
         assert!(
-            dir.ends_with("hallouminate"),
-            "state dir must terminate in the app subdir: {dir:?}"
+            dir.ends_with(hallouminate_config::channel::BUILD_CHANNEL.app_dir()),
+            "state dir must terminate in the channel app subdir: {dir:?}"
         );
         assert!(dir.is_absolute(), "state dir must be absolute: {dir:?}");
     }

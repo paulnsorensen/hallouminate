@@ -18,7 +18,7 @@ use tokio::net::UnixStream;
 use super::bootstrap::ensure_daemon_running;
 use super::framing::{MAX_IPC_LINE_BYTES, ipc_lines};
 use super::ipc::{DaemonRequest, DaemonRequestPayload, DaemonResponse, ErrorKind};
-use super::socket::daemon_socket_path;
+use super::socket::{SocketSource, checked_socket_path, daemon_socket_path};
 
 /// Client handle: just remembers which socket path to dial. Stateless
 /// otherwise — every `call` opens a fresh connection.
@@ -59,7 +59,10 @@ where
     Fut: std::future::Future<Output = anyhow::Result<()>>,
 {
     match socket {
-        Some(path) => connect_at(path).await,
+        Some(path) => {
+            checked_socket_path(path.to_path_buf(), SocketSource::ExplicitFlag)?;
+            connect_at(path).await
+        }
         None => {
             let socket = daemon_socket_path()?;
             connect_or_spawn(&socket, respawn).await
@@ -304,12 +307,69 @@ mod tests {
             async { anyhow::Ok(()) }
         })
         .await;
-        result.expect_err("connect to a missing socket must fail");
+        let error = result.expect_err("connect to a missing socket must fail");
+        let message = error.to_string();
+        assert!(
+            message.contains("daemon unavailable: cannot connect to"),
+            "got: {message}"
+        );
         assert_eq!(
             calls.load(Ordering::SeqCst),
             0,
             "explicit-socket path must never invoke the respawn step",
         );
+    }
+
+    #[tokio::test]
+    async fn explicit_socket_overlong_path_reports_flag_before_dial() {
+        let capacity = super::super::socket::SUN_PATH_CAPACITY;
+        let path = PathBuf::from(format!("/{}", "s".repeat(capacity)));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_ref = Arc::clone(&calls);
+        let error = client_for_with(Some(&path), || {
+            calls_ref.fetch_add(1, Ordering::SeqCst);
+            async { anyhow::Ok(()) }
+        })
+        .await
+        .expect_err("overlong explicit socket path must fail before dialing");
+        let source = error.downcast_ref::<std::io::Error>().expect("I/O error");
+        assert_eq!(source.kind(), std::io::ErrorKind::InvalidInput);
+        let message = error.to_string();
+        assert!(message.contains("--socket path"), "got: {message}");
+        assert!(
+            message.contains(&path.display().to_string()),
+            "got: {message}"
+        );
+        assert!(
+            message.contains(&format!("at most {} bytes", capacity - 1)),
+            "got: {message}"
+        );
+        assert!(
+            message.contains(&format!("{capacity} with the trailing NUL")),
+            "got: {message}"
+        );
+        assert!(
+            message.contains("pass a shorter path with --socket"),
+            "got: {message}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn explicit_socket_short_live_path_connects_without_respawn() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let socket = tmp.path().join("daemon.sock");
+        let _listener = tokio::net::UnixListener::bind(&socket).expect("bind socket");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_ref = Arc::clone(&calls);
+        let client = client_for_with(Some(&socket), || {
+            calls_ref.fetch_add(1, Ordering::SeqCst);
+            async { anyhow::Ok(()) }
+        })
+        .await
+        .expect("short explicit socket path must connect");
+        assert_eq!(client.socket_path(), socket.as_path());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
