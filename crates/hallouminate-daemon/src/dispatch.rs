@@ -58,6 +58,7 @@ use hallouminate_domain::repository::{RepoCorpusKind, repo_corpus_name};
 use hallouminate_domain::repository::{RepositoryConfig, default_wiki_for_cwd};
 use hallouminate_domain::search::validate_phrase;
 
+use super::failure_log::escape_controls;
 use super::ipc::{
     AddMarkdownBatchResult, AddMarkdownItem, AddMarkdownRequest, AddMarkdownResult, BUILD_IDENTITY,
     BacklinksRequest, BacklinksResult, CorpusEntry, CorpusStatsResult, DaemonRequest,
@@ -794,7 +795,7 @@ async fn handle_ground(
     .await;
     let mut response = match response {
         Ok(r) => r,
-        Err(e) => return DaemonResponse::internal(e.to_string()),
+        Err(e) => return ground_failure_response(&e),
     };
     if crossencoder_unavailable {
         response.warnings.push(Warning {
@@ -853,6 +854,27 @@ async fn handle_ground(
         },
     );
     DaemonResponse::ok(&GroundResult { outline, response })
+}
+
+/// Builds the Ground error response without echoing queries.
+fn ground_failure_response(
+    error: &hallouminate_domain::common::HallouminateError,
+) -> DaemonResponse {
+    use hallouminate_domain::common::HallouminateError;
+    let (class, echoes_query) = match error {
+        HallouminateError::Io(_) => ("io", false),
+        HallouminateError::Db(_) => ("db", false),
+        HallouminateError::StoreSchemaStale { .. } => ("store schema", false),
+        HallouminateError::Embed(_) => ("embed", true),
+        HallouminateError::Config(_) => ("config", true),
+        HallouminateError::Indexer(_) => ("indexer", true),
+        HallouminateError::Search(_) => ("search", true),
+    };
+    if echoes_query {
+        DaemonResponse::internal(format!("ground failed ({class} error)"))
+    } else {
+        DaemonResponse::internal(format!("ground failed ({class} error): {error}"))
+    }
 }
 
 /// Map a mutation-guard acquisition failure onto the wire. The Hard-debt
@@ -1024,34 +1046,18 @@ async fn read_existing_text(
                             "{mode_label} requires an existing file; {rel_disp} not found"
                         ))
                     } else {
-                        tracing::error!(
-                            target: "hallouminate::daemon",
-                            error = %source,
-                            path = %rel_disp,
-                            "read_existing_text io error",
-                        );
                         DaemonResponse::internal(format!("failed to read {rel_disp}: {source}"))
                     }
                 }
                 WriteErrorKind::Symlink | WriteErrorKind::InvalidPath => {
                     DaemonResponse::invalid_params(format!("refusing unsafe path {rel_disp}"))
                 }
-                WriteErrorKind::Exists => {
-                    tracing::error!(
-                        target: "hallouminate::daemon",
-                        path = %rel_disp,
-                        "read_existing_text: unexpected Exists variant on read path",
-                    );
-                    DaemonResponse::internal("unexpected Exists on read")
-                }
+                WriteErrorKind::Exists => DaemonResponse::internal(format!(
+                    "unexpected Exists variant on read of {rel_disp}"
+                )),
             });
         }
         Err(e) => {
-            tracing::error!(
-                target: "hallouminate::daemon",
-                error = %e,
-                "read_existing_text read task panicked",
-            );
             return Err(DaemonResponse::internal(format!("read task panicked: {e}")));
         }
     };
@@ -1096,7 +1102,9 @@ async fn handle_add_markdown_batch(
     }
     let mut results = Vec::with_capacity(requests.len());
     for request in requests {
-        results.push(handle_add_markdown(state, cfg, request).await);
+        let response = handle_add_markdown(state, cfg, request).await;
+        super::failure_log::log_error_response(Some("add_markdown_batch"), &response);
+        results.push(response);
     }
     DaemonResponse::ok(&AddMarkdownBatchResult { results })
 }
@@ -1283,13 +1291,6 @@ async fn handle_add_markdown(
             return resp;
         }
         Err(join_err) => {
-            // Non-retriable: a panicked blocking task means the write lane is
-            // in an unknown state, so log at error (not warn) for alerting.
-            tracing::error!(
-                target: "hallouminate::daemon",
-                error = %join_err,
-                "add_markdown write task panicked",
-            );
             return DaemonResponse::internal(format!("write task panicked: {join_err}"));
         }
     };
@@ -1385,6 +1386,12 @@ async fn handle_add_markdown(
     let mut ancestor_problems: Vec<String> = ancestors.failure.into_iter().collect();
     ancestor_problems.extend(ancestors_skipped);
     if !ancestor_problems.is_empty() {
+        tracing::warn!(
+            target: "hallouminate::daemon",
+            count = ancestor_problems.len(),
+            path = %escape_controls(&dest.to_string_lossy()),
+            "add_markdown: ancestor index refresh failed after durable write",
+        );
         warnings.push(format!(
             "wrote {} but ancestor index refresh failed: {}; run `index` to repair",
             relative.display(),
@@ -1461,11 +1468,6 @@ async fn handle_read_markdown(
         Ok(Ok(t)) => t,
         Ok(Err(resp)) => return resp,
         Err(join_err) => {
-            tracing::error!(
-                target: "hallouminate::daemon",
-                error = %join_err,
-                "read_markdown read task panicked",
-            );
             return DaemonResponse::internal(format!("read task panicked: {join_err}"));
         }
     };
@@ -1541,11 +1543,6 @@ async fn handle_backlinks(cfg: &Config, cwd: &Path, req: BacklinksRequest) -> Da
     let (backlinks, failures) = match scanned {
         Ok(r) => r,
         Err(join_err) => {
-            tracing::error!(
-                target: "hallouminate::daemon",
-                error = %join_err,
-                "backlinks scan task panicked",
-            );
             return DaemonResponse::internal(format!("backlinks task panicked: {join_err}"));
         }
     };
@@ -1655,11 +1652,6 @@ async fn handle_delete_markdown(
             return map_delete_error(kind, source, &error_relative);
         }
         Err(join_err) => {
-            tracing::error!(
-                target: "hallouminate::daemon",
-                error = %join_err,
-                "delete_markdown unlink task panicked",
-            );
             return DaemonResponse::internal(format!("unlink task panicked: {join_err}"));
         }
     }
@@ -2348,14 +2340,7 @@ async fn write_ancestor_index(root: &Path, dir: &Path) -> Result<Option<WrittenI
             .map(|path| WrittenIndex { path, bytes })
     })
     .await
-    .map_err(|e| {
-        tracing::error!(
-            target: "hallouminate::daemon",
-            error = %e,
-            "write_ancestor_index write task panicked",
-        );
-        format!("index write task panicked: {e}")
-    })?;
+    .map_err(|e| format!("index write task panicked: {e}"))?;
     match written {
         Ok(written) => Ok(Some(written)),
         Err(WriteError { kind, source }) => Err(format!(
@@ -4828,6 +4813,60 @@ mod tests {
                 self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
         }
+    }
+
+    #[test]
+    fn logging_ground_failure_response_preserves_wire_messages_without_a_handler_log() {
+        use hallouminate_domain::common::HallouminateError;
+
+        let (capture, _guard) = crate::test_support::EventCapture::install();
+        let stale = HallouminateError::StoreSchemaStale {
+            found: 1,
+            expected: 2,
+            ground_dir: std::path::PathBuf::from("/stale/ground"),
+        };
+        let private_cause = "rg: secret-query-text";
+        let redacted = [
+            (HallouminateError::Embed(private_cause.to_string()), "embed"),
+            (
+                HallouminateError::Config(private_cause.to_string()),
+                "config",
+            ),
+            (
+                HallouminateError::Indexer(private_cause.to_string()),
+                "indexer",
+            ),
+            (
+                HallouminateError::Search(private_cause.to_string()),
+                "search",
+            ),
+        ];
+
+        let stale_message = match ground_failure_response(&stale) {
+            DaemonResponse::Err { kind, message } => {
+                assert_eq!(kind, ErrorKind::Internal);
+                message
+            }
+            DaemonResponse::Ok { .. } => panic!("ground failure must be an error response"),
+        };
+        for (error, class) in redacted {
+            let message = match ground_failure_response(&error) {
+                DaemonResponse::Err { kind, message } => {
+                    assert_eq!(kind, ErrorKind::Internal);
+                    message
+                }
+                DaemonResponse::Ok { .. } => panic!("ground failure must be an error response"),
+            };
+            assert_eq!(message, format!("ground failed ({class} error)"));
+            assert!(!message.contains(private_cause), "{message}");
+        }
+
+        assert_eq!(
+            stale_message,
+            format!("ground failed (store schema error): {stale}")
+        );
+        let events = capture.events_for("hallouminate::daemon");
+        assert!(events.is_empty(), "{events:?}");
     }
 
     /// WHY (AC-6): a ground call on a never-registered root registers it and

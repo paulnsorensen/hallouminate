@@ -92,6 +92,28 @@ pub enum DaemonRequestPayload {
     Shutdown,
 }
 
+impl DaemonRequestPayload {
+    /// Returns the snake_case operation name, equal to the wire `op` tag.
+    pub fn op_name(&self) -> &'static str {
+        match self {
+            Self::Ping => "ping",
+            Self::Ground(_) => "ground",
+            Self::Index(_) => "index",
+            Self::ListCorpora => "list_corpora",
+            Self::ListFiles(_) => "list_files",
+            Self::ListTree(_) => "list_tree",
+            Self::AddMarkdown(_) => "add_markdown",
+            Self::AddMarkdownBatch { .. } => "add_markdown_batch",
+            Self::ReadMarkdown(_) => "read_markdown",
+            Self::DeleteMarkdown(_) => "delete_markdown",
+            Self::Backlinks(_) => "backlinks",
+            Self::CorpusStats { .. } => "corpus_stats",
+            Self::Status => "status",
+            Self::Shutdown => "shutdown",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GroundRequest {
     pub query: String,

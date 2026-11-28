@@ -206,7 +206,7 @@ async fn running_daemon_verdict(socket: &Path) -> (SkewVerdict, Option<String>) 
             return (SkewVerdict::Restart, None);
         }
     };
-    let probe = client.call_raw(DaemonRequest {
+    let probe = client.call_raw_quiet(DaemonRequest {
         cwd: std::env::current_dir().unwrap_or_default(),
         payload: DaemonRequestPayload::Ping,
     });

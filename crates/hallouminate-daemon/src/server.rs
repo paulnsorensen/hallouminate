@@ -21,6 +21,7 @@ use tokio_util::codec::LinesCodecError;
 use hallouminate_config::{self, Config};
 
 use super::dispatch::dispatch;
+use super::failure_log::log_error_response;
 use super::framing::{MAX_IPC_LINE_BYTES, ipc_lines};
 use super::heartbeat::TaskName;
 use super::ipc::{DaemonRequest, DaemonResponse};
@@ -668,17 +669,30 @@ async fn handle_connection(
         return Ok(());
     };
     let mut idle_clock = IdleClock::Keep;
+    let mut op = None;
     let response = match frame {
         Ok(line) => match serde_json::from_str::<DaemonRequest>(&line) {
-            Ok(req) => match authorize_peer(peer_uid, effective_uid, &req.payload) {
-                Some(denied) => denied,
-                None => {
-                    let candidate_idle_clock = idle_clock_for(&req.payload);
-                    let response = dispatch(&state, req).await;
-                    idle_clock = idle_clock_for_response(candidate_idle_clock, &response);
-                    response
+            Ok(req) => {
+                op = Some(req.payload.op_name());
+                match authorize_peer(peer_uid, effective_uid, &req.payload) {
+                    Some(denied) => {
+                        tracing::warn!(
+                            target: "hallouminate::daemon",
+                            op,
+                            peer_uid = ?peer_uid,
+                            effective_uid,
+                            "mutating request denied by peer authorization",
+                        );
+                        denied
+                    }
+                    None => {
+                        let candidate_idle_clock = idle_clock_for(&req.payload);
+                        let response = dispatch(&state, req).await;
+                        idle_clock = idle_clock_for_response(candidate_idle_clock, &response);
+                        response
+                    }
                 }
-            },
+            }
             Err(e) => DaemonResponse::invalid_params(format!("invalid request: {e}")),
         },
         Err(LinesCodecError::MaxLineLengthExceeded) => {
@@ -699,7 +713,8 @@ async fn handle_connection(
     // Request completed. Every request stamps the External clock; only
     // inference-bearing requests restart the idle-exit window (ADR-004).
     state.touch_activity(WorkClass::External, idle_clock);
-    let text = response_frame(&response)?;
+    let (response, text) = response_frame(response)?;
+    log_error_response(op, &response);
     let write_result = tokio::time::timeout(idle_timeout, async {
         write_half.write_all(text.as_bytes()).await?;
         write_half.flush().await
@@ -718,21 +733,23 @@ async fn handle_connection(
     Ok(())
 }
 
-/// Serializes one response line. A response that cannot fit one IPC frame
-/// becomes an `invalid_params` error that names the byte counts, because the
-/// client would otherwise fail on the frame limit without a reason.
-fn response_frame(response: &DaemonResponse) -> serde_json::Result<String> {
-    let mut text = serde_json::to_string(response)?;
+/// Serializes one response line and returns it with the response it encodes.
+/// A response that cannot fit one IPC frame becomes an `invalid_params` error
+/// that names the byte counts, because the client would otherwise fail on the
+/// frame limit without a reason.
+fn response_frame(response: DaemonResponse) -> serde_json::Result<(DaemonResponse, String)> {
+    let mut text = serde_json::to_string(&response)?;
     text.push('\n');
     if text.len() <= MAX_IPC_LINE_BYTES {
-        return Ok(text);
+        return Ok((response, text));
     }
     let oversize = text.len();
-    let mut error = serde_json::to_string(&DaemonResponse::invalid_params(format!(
+    let response = DaemonResponse::invalid_params(format!(
         "response is {oversize} bytes; the IPC limit is {MAX_IPC_LINE_BYTES} bytes. Narrow the request, for example with a smaller limit or corpus"
-    )))?;
-    error.push('\n');
-    Ok(error)
+    ));
+    let mut text = serde_json::to_string(&response)?;
+    text.push('\n');
+    Ok((response, text))
 }
 
 /// Classify a request for the idle-exit window (ADR daemon-idle-exit-004).
@@ -926,12 +943,28 @@ mod tests {
     }
 
     async fn exchange_request(bytes: Vec<u8>) -> Option<DaemonResponse> {
+        exchange_request_with(|_, _| {}, |_| bytes).await
+    }
+
+    async fn exchange_request_with(
+        configure: impl FnOnce(&mut Config, &Path),
+        request: impl FnOnce(&Path) -> Vec<u8>,
+    ) -> Option<DaemonResponse> {
         let tmp = tempfile::tempdir().expect("tempdir");
         let mut cfg = Config::default();
         cfg.embeddings.enabled = false;
         cfg.storage.ground_dir = tmp.path().join("ground").to_string_lossy().into_owned();
+        configure(&mut cfg, tmp.path());
+        let bytes = request(tmp.path());
         let state = DaemonState::open(cfg, None).await.expect("open state");
-        let socket = tmp.path().join("request.sock");
+        exchange_on_socket(state, tmp.path().join("request.sock"), bytes).await
+    }
+
+    async fn exchange_on_socket(
+        state: DaemonState,
+        socket: PathBuf,
+        bytes: Vec<u8>,
+    ) -> Option<DaemonResponse> {
         let listener = UnixListener::bind(&socket).expect("bind request socket");
         let client = tokio::spawn(async move {
             let mut stream = UnixStream::connect(&socket).await.expect("connect request");
@@ -970,7 +1003,10 @@ mod tests {
     #[test]
     fn oversize_response_becomes_an_invalid_params_error_naming_byte_counts() {
         let oversize = DaemonResponse::ok(&"x".repeat(MAX_IPC_LINE_BYTES));
-        let frame = response_frame(&oversize).expect("frame");
+        let (sent, frame) = response_frame(oversize).expect("frame");
+        let DaemonResponse::Err { .. } = sent else {
+            panic!("the returned response must be the error that was framed");
+        };
         assert!(frame.len() <= MAX_IPC_LINE_BYTES, "{}", frame.len());
         let DaemonResponse::Err { kind, message } =
             serde_json::from_str(frame.trim_end()).expect("parse frame")
@@ -988,7 +1024,7 @@ mod tests {
     #[test]
     fn response_at_the_frame_cap_passes_through() {
         let text = "x".repeat(MAX_IPC_LINE_BYTES - 64);
-        let frame = response_frame(&DaemonResponse::ok(&text)).expect("frame");
+        let (_, frame) = response_frame(DaemonResponse::ok(&text)).expect("frame");
         assert!(frame.len() <= MAX_IPC_LINE_BYTES);
         let DaemonResponse::Ok { .. } = serde_json::from_str(frame.trim_end()).expect("parse")
         else {
@@ -1036,6 +1072,222 @@ mod tests {
     async fn request_without_lf_is_decoded_at_eof() {
         let response = exchange_request(ping_request_bytes()).await;
         assert_ping_response(response);
+    }
+
+    fn daemon_events(
+        capture: &crate::test_support::EventCapture,
+    ) -> Vec<crate::test_support::CapturedEvent> {
+        capture.events_for("hallouminate::daemon")
+    }
+
+    #[tokio::test]
+    async fn internal_error_response_logs_one_error_event_with_the_message() {
+        let (capture, _guard) = crate::test_support::EventCapture::install();
+        let response = exchange_request_with(
+            |cfg, tmp| {
+                cfg.corpora.push(hallouminate_domain::common::CorpusConfig {
+                    name: "broken".to_string(),
+                    paths: vec![tmp.join("docs").to_string_lossy().into_owned()],
+                    globs: vec!["a[b".to_string()],
+                    exclude: Vec::new(),
+                    global: false,
+                });
+            },
+            |cwd| {
+                serde_json::to_vec(&DaemonRequest {
+                    cwd: cwd.to_path_buf(),
+                    payload: super::super::ipc::DaemonRequestPayload::ListFiles(
+                        super::super::ipc::ListFilesRequest {
+                            corpus: Some("broken".to_string()),
+                        },
+                    ),
+                })
+                .expect("serialize request")
+            },
+        )
+        .await;
+        let message = match response.expect("response") {
+            DaemonResponse::Err { kind, message } => {
+                assert_eq!(kind, super::super::ipc::ErrorKind::Internal, "{message}");
+                message
+            }
+            DaemonResponse::Ok { result } => panic!("invalid glob listed files: {result:?}"),
+        };
+        let events = daemon_events(&capture);
+        let mut errors = Vec::new();
+        for event in &events {
+            if event.level == tracing::Level::ERROR {
+                errors.push(event);
+            }
+        }
+        assert_eq!(errors.len(), 1, "{events:?}");
+        let event = errors[0];
+        assert_eq!(
+            event.fields.get("kind").map(String::as_str),
+            Some("Internal")
+        );
+        assert_eq!(
+            event.fields.get("op").map(String::as_str),
+            Some("list_files")
+        );
+        let logged = event.fields.get("message").expect("message field");
+        assert!(logged.contains(&message), "{logged} lacks {message}");
+    }
+
+    #[tokio::test]
+    async fn logging_ground_search_failure_has_one_error_and_keeps_wire_message() {
+        use hallouminate_domain::common::CorpusConfig;
+        use std::os::unix::ffi::OsStrExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let seed = tmp.path().join("seed");
+        std::fs::create_dir(&seed).expect("create seed root");
+        std::fs::write(seed.join("note.md"), "# Seed\n\nFixture text.\n").expect("write seed");
+        let broken = tmp.path().join("broken");
+        let non_utf8 = tmp
+            .path()
+            .join(std::ffi::OsStr::from_bytes(b"non-utf8-root-\xff"));
+        std::fs::create_dir(&non_utf8).expect("create non-UTF-8 root");
+        std::os::unix::fs::symlink(non_utf8, &broken).expect("link broken root");
+
+        let mut cfg = Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.search.cold_wait_ms = 0;
+        cfg.storage.ground_dir = tmp.path().join("ground").display().to_string();
+        for (name, path) in [("seed", seed), ("broken", broken)] {
+            cfg.corpora.push(CorpusConfig {
+                name: name.into(),
+                paths: vec![path.display().to_string()],
+                globs: vec!["**/*.md".into()],
+                exclude: Vec::new(),
+                global: false,
+            });
+        }
+        let state = DaemonState::open(cfg, None).await.expect("open state");
+        let index: DaemonRequest = serde_json::from_value(serde_json::json!({
+            "cwd": tmp.path(),
+            "payload": {"op": "index", "corpus": "seed"},
+        }))
+        .expect("build index request");
+        let indexed = dispatch(&state, index).await;
+        let DaemonResponse::Ok { result } = indexed else {
+            panic!("index seed: {indexed:?}");
+        };
+        assert_eq!(result["corpora"][0]["name"], "seed", "{result}");
+
+        let query = "private-ground-query-c94b";
+        let request = serde_json::to_vec(&serde_json::json!({
+            "cwd": tmp.path(),
+            "payload": {"op": "ground", "corpus": "broken", "query": query, "match_mode": "phrase"},
+        }))
+        .expect("serialize ground request");
+        let (capture, _guard) = crate::test_support::RenderedLogs::install("hallouminate=info");
+        let response =
+            exchange_on_socket(state, tmp.path().join("ground-test.sock"), request).await;
+        let DaemonResponse::Err { kind, message } = response.expect("response") else {
+            panic!("the store must reject the non-UTF-8 root");
+        };
+        assert_eq!(kind, super::super::ipc::ErrorKind::Internal);
+        assert_eq!(message, "ground failed (indexer error)");
+
+        let logs = capture.rendered();
+        let mut failures = Vec::new();
+        for line in logs.lines() {
+            if line.contains("ground failed") || line.contains(r#"op="ground""#) {
+                failures.push(line);
+            }
+        }
+        assert_eq!(failures.len(), 1, "{logs}");
+        assert!(failures[0].contains(" ERROR "), "{logs}");
+        assert!(failures[0].contains(r#"op="ground""#), "{logs}");
+        assert!(failures[0].contains("kind=Internal"), "{logs}");
+        assert!(failures[0].contains("indexer error"), "{logs}");
+        assert!(!logs.contains(query), "{logs}");
+    }
+
+    #[tokio::test]
+    async fn logging_invalid_json_keeps_request_values_only_on_wire() {
+        let marker = "private-request-op-8f25";
+        let (capture, _guard) = crate::test_support::EventCapture::install();
+        let request = format!(r#"{{"cwd":".","payload":{{"op":"{marker}"}}}}"#);
+        let message = invalid_request_message(exchange_request(request.into_bytes()).await);
+        assert!(message.contains(marker), "{message}");
+        let events = daemon_events(&capture);
+        let mut failures = Vec::new();
+        for event in &events {
+            if event.fields.contains_key("kind") {
+                failures.push(event);
+            }
+        }
+        assert_eq!(failures.len(), 1, "{events:?}");
+        let event = failures[0];
+        assert_eq!(event.level, tracing::Level::DEBUG);
+        assert_eq!(
+            event.fields.get("kind").map(String::as_str),
+            Some("InvalidParams")
+        );
+        assert_eq!(event.fields.get("op"), None);
+        let logged = event.fields.get("message").expect("message field");
+        assert!(!logged.contains(marker), "{logged}");
+        assert_eq!(logged, "request failed");
+    }
+
+    #[tokio::test]
+    async fn successful_request_logs_no_failure_event() {
+        let (capture, _guard) = crate::test_support::EventCapture::install();
+        assert_ping_response(exchange_request(ping_request_bytes()).await);
+        for event in daemon_events(&capture) {
+            assert!(!event.fields.contains_key("kind"), "{event:?}");
+        }
+    }
+
+    #[test]
+    fn logging_error_kinds_use_their_levels_without_non_internal_message_text() {
+        let (capture, _guard) = crate::test_support::EventCapture::install();
+        log_error_response(
+            Some("ground"),
+            &DaemonResponse::retryable("private-retryable-91e7"),
+        );
+        log_error_response(
+            Some("ground"),
+            &DaemonResponse::invalid_params("private-invalid-902f"),
+        );
+        log_error_response(Some("ground"), &DaemonResponse::internal("boom"));
+        log_error_response(Some("ground"), &DaemonResponse::ok(&"fine"));
+        let mut levels = Vec::new();
+        for event in daemon_events(&capture) {
+            levels.push(event.level);
+            if event.level != tracing::Level::ERROR {
+                assert_eq!(event.fields["message"], "request failed");
+            }
+        }
+        assert_eq!(
+            levels,
+            vec![
+                tracing::Level::INFO,
+                tracing::Level::DEBUG,
+                tracing::Level::ERROR
+            ]
+        );
+    }
+
+    #[test]
+    fn internal_failure_diagnostics_escape_controls_without_changing_wire_text() {
+        let (capture, _guard) = crate::test_support::EventCapture::install();
+        let response = DaemonResponse::internal("first\r\nsecond\tline");
+        let (sent, frame) = response_frame(response).expect("frame error response");
+        log_error_response(Some("list_files"), &sent);
+        let events = daemon_events(&capture);
+        assert_eq!(events.len(), 1, "{events:?}");
+        let logged = events[0].fields.get("message").expect("message field");
+        assert_eq!(logged, r"request failed: first\r\nsecond\tline");
+        let DaemonResponse::Err { kind, message } =
+            serde_json::from_str(&frame).expect("decode wire response")
+        else {
+            panic!("response must be an error");
+        };
+        assert_eq!(kind, super::super::ipc::ErrorKind::Internal);
+        assert_eq!(message, "first\r\nsecond\tline");
     }
 
     #[tokio::test]

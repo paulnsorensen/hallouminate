@@ -24,6 +24,7 @@ mod churn;
 mod client;
 mod debt;
 mod dispatch;
+mod failure_log;
 mod framing;
 mod heartbeat;
 mod ipc;

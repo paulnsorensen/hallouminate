@@ -23,6 +23,7 @@ serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
 anyhow.workspace = true
+tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tracing-appender = "0.2"
 file-rotate = "0.8"
@@ -35,7 +36,6 @@ rmcp = { version = "3.0", features = ["server", "macros", "transport-io", "schem
 tempfile = "3"
 tokio = { workspace = true, features = ["test-util"] }
 rustix.workspace = true
-tracing.workspace = true
 # Spreadsheet ingestion tests generate fixtures in-process (no committed binaries):
 # rust_xlsxwriter writes a real .xlsx calamine can read; .ods is a hand-built ZIP
 # (mimetype + content.xml + META-INF/manifest.xml — calamine requires the manifest)
