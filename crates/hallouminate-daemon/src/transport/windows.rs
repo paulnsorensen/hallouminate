@@ -47,7 +47,7 @@ pub(crate) fn pipe_name(path: &Path) -> io::Result<String> {
 }
 
 /// Reports whether `error` means that every pipe instance is in use.
-pub(crate) fn is_pipe_busy(error: &io::Error) -> bool {
+pub fn is_pipe_busy(error: &io::Error) -> bool {
     error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32)
 }
 
@@ -82,7 +82,8 @@ fn create_server(name: &str, instance: Instance) -> io::Result<NamedPipeServer> 
     }
 }
 
-pub(crate) struct LocalListener {
+/// Accepts connections to an account-restricted local endpoint.
+pub struct LocalListener {
     name: String,
     /// The instance that waits for the next client. `None` after a failed
     /// replacement, until the next `accept` creates it again.
@@ -93,7 +94,7 @@ impl LocalListener {
     /// Creates the pipe and records its random name in an owner-only marker file at `path`.
     ///
     /// Fails when `path` exists, like a Unix socket bind.
-    pub(crate) fn bind(path: impl AsRef<Path>) -> io::Result<Self> {
+    pub fn bind(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref();
         let nonce = random_nonce()?;
         let name = pipe_name_for_nonce(&nonce);
@@ -115,7 +116,8 @@ impl LocalListener {
         }
     }
 
-    pub(crate) async fn accept(&self) -> io::Result<(LocalStream, ())> {
+    /// Accepts the next connection while keeping another pipe instance available.
+    pub async fn accept(&self) -> io::Result<(LocalStream, ())> {
         let mut slot = self.pending.lock().await;
         if slot.is_none() {
             match create_server(&self.name, Instance::Additional) {
@@ -150,14 +152,16 @@ impl LocalListener {
 ///
 /// Named pipes have no half-close, so `shutdown` does not send end-of-file.
 /// A request must end with a line feed.
-pub(crate) enum LocalStream {
+pub enum LocalStream {
+    /// A connection opened by a client.
     Client(NamedPipeClient),
+    /// A connection accepted by a server.
     Server(NamedPipeServer),
 }
 
 impl LocalStream {
     /// Connects to the daemon, waiting a bounded time while every pipe instance is busy.
-    pub(crate) async fn connect(path: impl AsRef<Path>) -> io::Result<Self> {
+    pub async fn connect(path: impl AsRef<Path>) -> io::Result<Self> {
         Self::connect_until(path, tokio::time::Instant::now() + BUSY_RETRY_BUDGET).await
     }
 
@@ -205,7 +209,8 @@ impl LocalStream {
         process_user_sid(pid)
     }
 
-    pub(crate) fn into_split(self) -> (ReadHalf<Self>, WriteHalf<Self>) {
+    /// Splits a connection into independently owned read and write halves.
+    pub fn into_split(self) -> (ReadHalf<Self>, WriteHalf<Self>) {
         tokio::io::split(self)
     }
 }
@@ -315,6 +320,38 @@ mod tests {
         assert_eq!(
             server.peer_user().expect("peer SID"),
             client.peer_user().expect("server SID")
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_endpoint_aliases_resolve_to_the_same_pipe() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let endpoint = directory.path().join("daemon.sock");
+        let listener = LocalListener::bind(&endpoint).expect("bind pipe");
+        let canonical = std::fs::canonicalize(&endpoint).expect("canonical endpoint");
+        let dotted = directory.path().join(".").join("daemon.sock");
+        let uppercase = directory.path().join("DAEMON.SOCK");
+        if uppercase.exists() {
+            assert_eq!(
+                pipe_name(&endpoint).expect("name"),
+                pipe_name(&uppercase).expect("case alias")
+            );
+        }
+        assert_eq!(
+            pipe_name(&endpoint).expect("name"),
+            pipe_name(&canonical).expect("canonical name")
+        );
+        assert_eq!(
+            pipe_name(&endpoint).expect("name"),
+            pipe_name(&dotted).expect("dotted name")
+        );
+        let client = LocalStream::connect(&canonical)
+            .await
+            .expect("connect alias");
+        let (server, ()) = listener.accept().await.expect("accept alias");
+        assert_eq!(
+            server.peer_user().expect("peer"),
+            client.peer_user().expect("server")
         );
     }
 }

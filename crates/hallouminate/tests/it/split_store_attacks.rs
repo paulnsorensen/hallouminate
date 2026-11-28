@@ -69,6 +69,27 @@ fn any_ends_with(paths: &[String], suffix: &str) -> bool {
     paths.iter().any(|path| path.ends_with(suffix))
 }
 
+fn path_in_root(path: &str, root: &str) -> bool {
+    Path::new(path)
+        .parent()
+        .is_some_and(|parent| parent.ends_with(root))
+}
+
+#[test]
+fn root_membership_checks_native_parent_components() {
+    let parent = Path::new("parent");
+    let own = parent.join("root-a").join("same.md");
+    let other = parent.join("root-b").join("same.md");
+    let near_name = parent.join("root-a-near").join("same.md");
+
+    assert!(path_in_root(own.to_str().expect("own path"), "root-a"));
+    assert!(!path_in_root(other.to_str().expect("other path"), "root-a"));
+    assert!(!path_in_root(
+        near_name.to_str().expect("near path"),
+        "root-a"
+    ));
+}
+
 struct TwoRoots {
     _parent: tempfile::TempDir,
     store_dir: tempfile::TempDir,
@@ -123,12 +144,15 @@ async fn split_store_root_a_never_surfaces_b_only_files() {
     assert!(!any_ends_with(&paths_a, "b_only.md"), "{paths_a:?}");
     assert!(!any_ends_with(&paths_b, "a_only.md"), "{paths_b:?}");
     for path in paths_a.iter().chain(paths_b.iter()) {
-        let in_a = path.contains("/root-a/");
-        let in_b = path.contains("/root-b/");
+        let in_a = path_in_root(path, "root-a");
+        let in_b = path_in_root(path, "root-b");
         assert!(in_a != in_b, "each hit names exactly one root: {path}");
     }
     for path in &paths_a {
-        assert!(path.contains("/root-a/"), "root A hit leaked to B: {path}");
+        assert!(
+            path_in_root(path, "root-a"),
+            "root A hit leaked to B: {path}"
+        );
     }
     let refs_a = file_refs(&store, &corpus_a).await;
     assert_eq!(refs_a.len(), 2, "{refs_a:?}");
@@ -219,7 +243,7 @@ async fn fresh_worktree_first_ground_answers_from_own_paths_and_embeds_nothing()
 
     assert_eq!(first_ground.len(), 1, "{first_ground:?}");
     assert!(
-        first_ground[0].ends_with("/root-b/same.md"),
+        Path::new(&first_ground[0]).ends_with(Path::new("root-b").join("same.md")),
         "the first ground answers from the worktree's own path: {first_ground:?}"
     );
     let embedded_b = index_with(&corpus_b, &store, 1500).await;
@@ -283,7 +307,10 @@ async fn split_store_identical_bytes_with_other_file_name_report_the_new_path() 
     let paths_b = ground_paths(&corpus_b, &store).await;
 
     assert_eq!(paths_b.len(), 1, "{paths_b:?}");
-    assert!(paths_b[0].ends_with("/root-b/two.md"), "{paths_b:?}");
+    assert!(
+        Path::new(&paths_b[0]).ends_with(Path::new("root-b").join("two.md")),
+        "{paths_b:?}"
+    );
     let refs_b = file_refs(&store, &corpus_b).await;
     assert!(!any_ends_with(&refs_b, "one.md"), "{refs_b:?}");
 }
@@ -358,7 +385,10 @@ async fn lexical_fallback_cold_root_b_never_surfaces_warm_root_a_files() {
     let paths_b = ground_paths(&corpus_b, &store).await;
 
     assert_eq!(paths_b.len(), 1, "{paths_b:?}");
-    assert!(paths_b[0].ends_with("/root-b/b_only.md"), "{paths_b:?}");
+    assert!(
+        Path::new(&paths_b[0]).ends_with(Path::new("root-b").join("b_only.md")),
+        "{paths_b:?}"
+    );
     let refs_b = file_refs(&store, &corpus_b).await;
     assert!(
         refs_b.is_empty(),
@@ -400,6 +430,7 @@ async fn lexical_fallback_term_in_indexed_and_unindexed_file_lists_each_once() {
     }
 }
 
+#[cfg(unix)]
 fn hook_command() -> String {
     let manifest = env!("CARGO_MANIFEST_DIR");
     let path = Path::new(manifest).join("../../plugins/hallouminate/hooks/hooks.json");
@@ -411,6 +442,7 @@ fn hook_command() -> String {
         .to_string()
 }
 
+#[cfg(unix)]
 fn run_hook_with_fake(script: &str) -> (Option<i32>, std::time::Duration) {
     let bin = tempfile::tempdir().expect("bin dir");
     let fake = bin.path().join("hallouminate");
@@ -427,12 +459,14 @@ fn run_hook_with_fake(script: &str) -> (Option<i32>, std::time::Duration) {
     (output.status.code(), started.elapsed())
 }
 
+#[cfg(unix)]
 #[test]
 fn session_start_hook_exits_zero_when_hallouminate_fails() {
     let (code, _) = run_hook_with_fake("#!/bin/sh\necho boom >&2\nexit 7\n");
     assert_eq!(code, Some(0), "a failing index must not fail the hook");
 }
 
+#[cfg(unix)]
 #[test]
 fn session_start_hook_does_not_hold_the_output_pipes_of_a_blocked_index() {
     let (code, elapsed) = run_hook_with_fake("#!/bin/sh\necho started\nsleep 5\n");

@@ -117,8 +117,11 @@ fn render_outline(response: &GroundResponse, strip_prefix: Option<&str>) -> Stri
 
 fn write_doc_block(buf: &mut String, path: &str, doc: &DocFile, strip_prefix: Option<&str>) {
     let display_path = match strip_prefix {
-        Some(p) if path.starts_with(p) => path.trim_start_matches(p).to_string(),
-        _ => path.to_string(),
+        Some(prefix) => match std::path::Path::new(path).strip_prefix(prefix) {
+            Ok(relative) => relative.display().to_string(),
+            Err(_error) => path.to_string(),
+        },
+        None => path.to_string(),
     };
     if let Some(FileCoverage { chunks, pages }) = doc.coverage {
         write!(
@@ -259,6 +262,21 @@ mod tests {
             !out.contains("/home/u/.cheese/research/cheese-flow/"),
             "no residual prefix: {out}"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn outline_strips_windows_prefix_with_mixed_separators() {
+        let mut response = fixture();
+        let (_path, doc) = response.docs.pop_first().expect("fixture document");
+        response.docs.insert(r"C:\wiki\INDEX.md".to_string(), doc);
+        let opts = RenderOpts {
+            path_prefix_strip: Some("C:\\wiki/".into()),
+            ..Default::default()
+        };
+        let out = render(&response, Format::Outline, &opts);
+        assert!(out.contains("INDEX.md  (0.873)"), "{out}");
+        assert!(!out.contains(r"C:\wiki"), "{out}");
     }
 
     #[test]

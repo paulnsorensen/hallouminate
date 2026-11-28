@@ -214,6 +214,12 @@ fn session_start_hook_runs_background_index_and_always_exits_zero() {
         "codex plugin must reference the shared hook file"
     );
 
+    #[cfg(unix)]
+    check_session_start_hook_execution(command);
+}
+
+#[cfg(unix)]
+fn check_session_start_hook_execution(command: &str) {
     let empty = tempfile::tempdir().expect("tempdir");
     let status = std::process::Command::new("/bin/sh")
         .args(["-c", command])
@@ -555,7 +561,9 @@ fn wiki_harvest_memory_skill_is_explicit_only() {
 
 fn read_pack_file(relative: &str) -> String {
     let path = repo_root().join(relative);
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+        .replace("\r\n", "\n")
 }
 
 /// First non-blank line after the closing `---` fence — the H1-first rule's

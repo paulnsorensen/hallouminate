@@ -21,7 +21,7 @@ use hallouminate_daemon::{
     AddMarkdownRequest, BacklinksRequest, CorpusStatsResult, DaemonClient, DaemonRequest,
     DaemonRequestPayload, DaemonResponse, DaemonState, DeleteMarkdownRequest, ErrorKind,
     GroundRequest, GroundResult, IndexRequest, LineRange, ListFilesRequest, ListFilesResult,
-    Position, ReadMarkdownRequest, StatusReport, connect_at, serve, spawn_signal_handlers,
+    Position, ReadMarkdownRequest, StatusReport, connect_at, serve,
 };
 use hallouminate_domain::common::CorpusKey;
 use hallouminate_domain::indexer::ChunkStore;
@@ -36,13 +36,13 @@ fn cfg_with_repository(ground_dir: &Path, repo_name: &str, repo_path: &Path) -> 
         r#"
 [[repository]]
 name = "{repo_name}"
-path = "{repo}"
+path = {repo}
 
 [storage]
-ground_dir = "{ground}"
+ground_dir = {ground}
 "#,
-        repo = repo_path.display(),
-        ground = ground_dir.display(),
+        repo = toml::Value::String(repo_path.display().to_string()),
+        ground = toml::Value::String(ground_dir.display().to_string()),
     );
     let cfg: Config = toml::from_str(&toml).expect("repository toml parses");
     cfg
@@ -111,14 +111,14 @@ async fn daemon_client_reconnect_failure_carries_start_hint() {
         r#"
 [[corpus]]
 name = "docs"
-paths = ["{c}"]
+paths = [{c}]
 globs = ["**/*.md"]
 
 [storage]
-ground_dir = "{g}"
+ground_dir = {g}
 "#,
-        c = corpus_root.display(),
-        g = ground.display(),
+        c = toml::Value::String(corpus_root.display().to_string()),
+        g = toml::Value::String(ground.display().to_string()),
     );
     let cfg: Config = toml::from_str(&toml).expect("parse cfg");
     let harness = DaemonHarness::spawn(cfg).await;
@@ -179,14 +179,14 @@ async fn daemon_serializes_concurrent_writes_to_the_same_corpus() {
         r#"
 [[corpus]]
 name = "docs"
-paths = ["{}"]
+paths = [{}]
 globs = ["**/*.md"]
 
 [storage]
-ground_dir = "{}"
+ground_dir = {}
 "#,
-        corpus_root.display(),
-        ground.display(),
+        toml::Value::String(corpus_root.display().to_string()),
+        toml::Value::String(ground.display().to_string()),
     );
     let cfg: Config = toml::from_str(&toml).expect("parse cfg");
     let harness = DaemonHarness::spawn(cfg).await;
@@ -269,20 +269,20 @@ async fn per_corpus_mutex_does_not_block_writes_to_different_corpora() {
         r#"
 [[corpus]]
 name = "a"
-paths = ["{a}"]
+paths = [{a}]
 globs = ["**/*.md"]
 
 [[corpus]]
 name = "b"
-paths = ["{b}"]
+paths = [{b}]
 globs = ["**/*.md"]
 
 [storage]
-ground_dir = "{g}"
+ground_dir = {g}
 "#,
-        a = corpus_a.display(),
-        b = corpus_b.display(),
-        g = ground.display(),
+        a = toml::Value::String(corpus_a.display().to_string()),
+        b = toml::Value::String(corpus_b.display().to_string()),
+        g = toml::Value::String(ground.display().to_string()),
     );
     let cfg: Config = toml::from_str(&toml).expect("parse cfg");
     let harness = DaemonHarness::spawn(cfg).await;
@@ -454,17 +454,17 @@ async fn daemon_add_markdown_returns_lint_warnings_without_blocking_the_write() 
         r#"
 [[corpus]]
 name = "docs"
-paths = ["{c}"]
+paths = [{c}]
 globs = ["**/*.md"]
 
 [storage]
-ground_dir = "{g}"
+ground_dir = {g}
 
 [embeddings]
 enabled = false
 "#,
-        c = corpus_root.display(),
-        g = ground.display(),
+        c = toml::Value::String(corpus_root.display().to_string()),
+        g = toml::Value::String(ground.display().to_string()),
     );
     let cfg: Config = toml::from_str(&toml).expect("parse cfg");
     let harness = DaemonHarness::spawn(cfg).await;
@@ -541,17 +541,17 @@ async fn daemon_add_markdown_flags_dangling_wikilink() {
         r#"
 [[corpus]]
 name = "docs"
-paths = ["{c}"]
+paths = [{c}]
 globs = ["**/*.md"]
 
 [storage]
-ground_dir = "{g}"
+ground_dir = {g}
 
 [embeddings]
 enabled = false
 "#,
-        c = corpus_root.display(),
-        g = ground.display(),
+        c = toml::Value::String(corpus_root.display().to_string()),
+        g = toml::Value::String(ground.display().to_string()),
     );
     let cfg: Config = toml::from_str(&toml).expect("parse cfg");
     let harness = DaemonHarness::spawn(cfg).await;
@@ -632,17 +632,17 @@ async fn daemon_backlinks_returns_pages_linking_to_target() {
         r#"
 [[corpus]]
 name = "docs"
-paths = ["{c}"]
+paths = [{c}]
 globs = ["**/*.md"]
 
 [storage]
-ground_dir = "{g}"
+ground_dir = {g}
 
 [embeddings]
 enabled = false
 "#,
-        c = corpus_root.display(),
-        g = ground.display(),
+        c = toml::Value::String(corpus_root.display().to_string()),
+        g = toml::Value::String(ground.display().to_string()),
     );
     let cfg: Config = toml::from_str(&toml).expect("parse cfg");
     let harness = DaemonHarness::spawn(cfg).await;
@@ -726,16 +726,16 @@ async fn daemon_backlinks_on_uninitialized_wiki_returns_empty_result() {
         r#"
 [[repository]]
 name = "repo1"
-path = "{r}"
+path = {r}
 
 [storage]
-ground_dir = "{g}"
+ground_dir = {g}
 
 [embeddings]
 enabled = false
 "#,
-        r = repo_root.display(),
-        g = ground.display(),
+        r = toml::Value::String(repo_root.display().to_string()),
+        g = toml::Value::String(ground.display().to_string()),
     );
     let cfg: Config = toml::from_str(&toml).expect("parse cfg");
     let harness = DaemonHarness::spawn(cfg).await;
@@ -777,17 +777,17 @@ async fn daemon_backlinks_disambiguates_basename_collision() {
         r#"
 [[corpus]]
 name = "docs"
-paths = ["{c}"]
+paths = [{c}]
 globs = ["**/*.md"]
 
 [storage]
-ground_dir = "{g}"
+ground_dir = {g}
 
 [embeddings]
 enabled = false
 "#,
-        c = corpus_root.display(),
-        g = ground.display(),
+        c = toml::Value::String(corpus_root.display().to_string()),
+        g = toml::Value::String(ground.display().to_string()),
     );
     let cfg: Config = toml::from_str(&toml).expect("parse cfg");
     let harness = DaemonHarness::spawn(cfg).await;
@@ -862,17 +862,17 @@ async fn daemon_backlinks_reports_unreadable_file_as_warning() {
         r#"
 [[corpus]]
 name = "docs"
-paths = ["{c}"]
+paths = [{c}]
 globs = ["**/*.md"]
 
 [storage]
-ground_dir = "{g}"
+ground_dir = {g}
 
 [embeddings]
 enabled = false
 "#,
-        c = corpus_root.display(),
-        g = ground.display(),
+        c = toml::Value::String(corpus_root.display().to_string()),
+        g = toml::Value::String(ground.display().to_string()),
     );
     let cfg: Config = toml::from_str(&toml).expect("parse cfg");
     let harness = DaemonHarness::spawn(cfg).await;
@@ -1047,17 +1047,17 @@ async fn daemon_add_markdown_warns_on_malformed_frontmatter_block_and_stores_ver
         r#"
 [[corpus]]
 name = "docs"
-paths = ["{c}"]
+paths = [{c}]
 globs = ["**/*.md"]
 
 [storage]
-ground_dir = "{g}"
+ground_dir = {g}
 
 [embeddings]
 enabled = false
 "#,
-        c = corpus_root.display(),
-        g = ground.display(),
+        c = toml::Value::String(corpus_root.display().to_string()),
+        g = toml::Value::String(ground.display().to_string()),
     );
     let cfg: Config = toml::from_str(&toml).expect("parse cfg");
     let harness = DaemonHarness::spawn(cfg).await;
@@ -1145,17 +1145,17 @@ async fn daemon_add_markdown_warns_on_claim_marks_and_stores_verbatim() {
         r#"
 [[corpus]]
 name = "docs"
-paths = ["{c}"]
+paths = [{c}]
 globs = ["**/*.md"]
 
 [storage]
-ground_dir = "{g}"
+ground_dir = {g}
 
 [embeddings]
 enabled = false
 "#,
-        c = corpus_root.display(),
-        g = ground.display(),
+        c = toml::Value::String(corpus_root.display().to_string()),
+        g = toml::Value::String(ground.display().to_string()),
     );
     let cfg: Config = toml::from_str(&toml).expect("parse cfg");
     let harness = DaemonHarness::spawn(cfg).await;
@@ -1256,14 +1256,14 @@ async fn daemon_ping_returns_versioned_pong() {
         r#"
 [[corpus]]
 name = "docs"
-paths = ["{c}"]
+paths = [{c}]
 globs = ["**/*.md"]
 
 [storage]
-ground_dir = "{g}"
+ground_dir = {g}
 "#,
-        c = corpus_root.display(),
-        g = ground.display(),
+        c = toml::Value::String(corpus_root.display().to_string()),
+        g = toml::Value::String(ground.display().to_string()),
     );
     let cfg: Config = toml::from_str(&toml).expect("parse cfg");
     let harness = DaemonHarness::spawn(cfg).await;
@@ -1296,14 +1296,14 @@ async fn daemon_index_with_paths_from_returns_invalid_params() {
         r#"
 [[corpus]]
 name = "docs"
-paths = ["{c}"]
+paths = [{c}]
 globs = ["**/*.md"]
 
 [storage]
-ground_dir = "{g}"
+ground_dir = {g}
 "#,
-        c = corpus_root.display(),
-        g = ground.display(),
+        c = toml::Value::String(corpus_root.display().to_string()),
+        g = toml::Value::String(ground.display().to_string()),
     );
     let cfg: Config = toml::from_str(&toml).expect("parse cfg");
     let harness = DaemonHarness::spawn(cfg).await;
@@ -1341,8 +1341,8 @@ async fn daemon_malformed_json_request_returns_invalid_params() {
     // hang. Send raw bytes that look nothing like a DaemonRequest and
     // confirm the server still answers with one JSON line on the same
     // connection.
+    use hallouminate_daemon::transport::LocalStream as UnixStream;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::UnixStream;
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let ground = tmp.path().join("ground");
@@ -1352,14 +1352,14 @@ async fn daemon_malformed_json_request_returns_invalid_params() {
         r#"
 [[corpus]]
 name = "docs"
-paths = ["{c}"]
+paths = [{c}]
 globs = ["**/*.md"]
 
 [storage]
-ground_dir = "{g}"
+ground_dir = {g}
 "#,
-        c = corpus_root.display(),
-        g = ground.display(),
+        c = toml::Value::String(corpus_root.display().to_string()),
+        g = toml::Value::String(ground.display().to_string()),
     );
     let cfg: Config = toml::from_str(&toml).expect("parse cfg");
     let harness = DaemonHarness::spawn(cfg).await;
@@ -1400,8 +1400,8 @@ async fn daemon_closes_idle_connection_after_read_timeout() {
     // the per-connection task forever — the idle-read timeout closes the
     // connection so it can't leak. Use a harness-scoped short timeout so
     // this test doesn't wait out the real 30s production default.
+    use hallouminate_daemon::transport::LocalStream as UnixStream;
     use tokio::io::AsyncReadExt;
-    use tokio::net::UnixStream;
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let ground = tmp.path().join("ground");
@@ -1411,14 +1411,14 @@ async fn daemon_closes_idle_connection_after_read_timeout() {
         r#"
 [[corpus]]
 name = "docs"
-paths = ["{c}"]
+paths = [{c}]
 globs = ["**/*.md"]
 
 [storage]
-ground_dir = "{g}"
+ground_dir = {g}
 "#,
-        c = corpus_root.display(),
-        g = ground.display(),
+        c = toml::Value::String(corpus_root.display().to_string()),
+        g = toml::Value::String(ground.display().to_string()),
     );
     let cfg: Config = toml::from_str(&toml).expect("parse cfg");
     let harness = DaemonHarness::spawn_with_idle_timeout(cfg, Duration::from_millis(200)).await;
@@ -1451,14 +1451,14 @@ async fn daemon_single_instance_lock_blocks_second_serve_on_same_socket() {
         r#"
 [[corpus]]
 name = "docs"
-paths = ["{c}"]
+paths = [{c}]
 globs = ["**/*.md"]
 
 [storage]
-ground_dir = "{g}"
+ground_dir = {g}
 "#,
-        c = corpus_root.display(),
-        g = ground.display(),
+        c = toml::Value::String(corpus_root.display().to_string()),
+        g = toml::Value::String(ground.display().to_string()),
     );
     let cfg: Config = toml::from_str(&toml).expect("parse cfg");
 
@@ -1519,9 +1519,9 @@ fn seed_cwd(tmp: &Path) -> PathBuf {
 
 fn docs_cfg(ground_dir: &Path, corpus_root: &Path) -> Config {
     let toml = format!(
-        "[[corpus]]\nname = \"docs\"\npaths = [\"{c}\"]\nglobs = [\"**/*.md\"]\n\n[storage]\nground_dir = \"{g}\"\n",
-        c = corpus_root.display(),
-        g = ground_dir.display(),
+        "[[corpus]]\nname = \"docs\"\npaths = [{c}]\nglobs = [\"**/*.md\"]\n\n[storage]\nground_dir = {g}\n",
+        c = toml::Value::String(corpus_root.display().to_string()),
+        g = toml::Value::String(ground_dir.display().to_string()),
     );
     toml::from_str(&toml).expect("parse cfg")
 }
@@ -1638,6 +1638,7 @@ async fn ipc_shutdown_removes_socket_and_lockfile_and_refuses_new_connections() 
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn sigterm_removes_socket_and_refuses_new_connections() {
     // Quality gate (Curd 1): a SIGTERM must drive the *same* graceful exit as
@@ -1661,7 +1662,7 @@ async fn sigterm_removes_socket_and_refuses_new_connections() {
     let state = DaemonState::open(cfg, None).await.expect("open state");
     // Install the real signal handlers against this state's shutdown token
     // *before* serving, mirroring `serve_with_config`'s production order.
-    spawn_signal_handlers(&state);
+    hallouminate_daemon::spawn_signal_handlers(&state);
     let serve_state = state.clone();
     let socket_clone = socket.clone();
     let handle = tokio::spawn(async move { serve(&serve_state, &socket_clone).await });
@@ -1789,14 +1790,11 @@ async fn idle_exit_removes_socket_and_lockfile_and_refuses_new_connections() {
     // asserting on the first attempt.
     let relock_deadline = std::time::Instant::now() + Duration::from_secs(2);
     let result = loop {
-        let attempt = rustix::fs::flock(
-            &relock,
-            rustix::fs::FlockOperation::NonBlockingLockExclusive,
-        );
-        if attempt != Err(rustix::io::Errno::WOULDBLOCK)
-            || std::time::Instant::now() >= relock_deadline
-        {
-            break attempt;
+        match relock.try_lock() {
+            Ok(()) => break Ok(()),
+            Err(std::fs::TryLockError::WouldBlock)
+                if std::time::Instant::now() < relock_deadline => {}
+            Err(error) => break Err(error),
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
@@ -1865,14 +1863,15 @@ async fn client_for_default_socket_respawns_then_returns_the_reconnected_client(
     let respawns = Arc::new(AtomicUsize::new(0));
     // Keep the stub listener alive past the retry connect; a listener dropped
     // inside the closure would leave the retry dialing a dead socket.
-    let listener_holder: Arc<Mutex<Option<tokio::net::UnixListener>>> = Arc::new(Mutex::new(None));
+    let listener_holder: Arc<Mutex<Option<hallouminate_daemon::transport::LocalListener>>> =
+        Arc::new(Mutex::new(None));
     let respawns_ref = Arc::clone(&respawns);
     let holder_ref = Arc::clone(&listener_holder);
     let sock_ref = sock.clone();
 
     let result = hallouminate_daemon::client_for_with(None, move || async move {
         respawns_ref.fetch_add(1, Ordering::SeqCst);
-        let listener = tokio::net::UnixListener::bind(&sock_ref)?;
+        let listener = hallouminate_daemon::transport::LocalListener::bind(&sock_ref)?;
         *holder_ref.lock().unwrap() = Some(listener);
         anyhow::Ok(())
     })
@@ -1893,10 +1892,12 @@ async fn client_for_default_socket_respawns_then_returns_the_reconnected_client(
 
 /// Points `XDG_RUNTIME_DIR` at a directory for one test and restores the
 /// previous value on drop. Hold it only while an `EnvGuard` is alive.
+#[cfg(unix)]
 struct XdgRuntimeDir {
     previous: Option<std::ffi::OsString>,
 }
 
+#[cfg(unix)]
 impl XdgRuntimeDir {
     fn set(dir: &Path) -> Self {
         let previous = std::env::var_os("XDG_RUNTIME_DIR");
@@ -1905,6 +1906,7 @@ impl XdgRuntimeDir {
     }
 }
 
+#[cfg(unix)]
 impl Drop for XdgRuntimeDir {
     fn drop(&mut self) {
         match self.previous.take() {
@@ -1914,12 +1916,14 @@ impl Drop for XdgRuntimeDir {
     }
 }
 
+#[cfg(unix)]
 fn bind_legacy_xdg_socket(runtime_dir: &Path) -> tokio::net::UnixListener {
     let legacy_dir = runtime_dir.join("hallouminate");
     std::fs::create_dir_all(&legacy_dir).expect("mkdir legacy dir");
     tokio::net::UnixListener::bind(legacy_dir.join("daemon.sock")).expect("bind legacy socket")
 }
 
+#[cfg(unix)]
 async fn legacy_socket_was_dialed(listener: &tokio::net::UnixListener) -> bool {
     timeout(Duration::from_millis(200), listener.accept())
         .await
@@ -1930,6 +1934,7 @@ async fn legacy_socket_was_dialed(listener: &tokio::net::UnixListener) -> bool {
 // redirect it. On a host with a live canonical daemon, canonical-first code
 // with a legacy fallback also passes. CI runners have no canonical daemon, so
 // the test rejects a restored fallback there.
+#[cfg(unix)]
 #[tokio::test]
 async fn default_discovery_never_dials_a_socket_that_exists_only_at_the_legacy_xdg_path() {
     let _env = EnvGuard::set("HALLOUMINATE_SOCKET");
@@ -1948,6 +1953,7 @@ async fn default_discovery_never_dials_a_socket_that_exists_only_at_the_legacy_x
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn explicit_socket_override_wins_over_a_legacy_xdg_socket() {
     let _env = EnvGuard::set("HALLOUMINATE_SOCKET");
@@ -2251,7 +2257,8 @@ async fn status_surfaces_daemon_error_response_as_err_not_not_running() {
     let _env = EnvGuard::set("HALLOUMINATE_SOCKET");
     let tmp = tempfile::tempdir().expect("tempdir");
     let socket = tmp.path().join("erroring.sock");
-    let listener = tokio::net::UnixListener::bind(&socket).expect("bind stub socket");
+    let listener =
+        hallouminate_daemon::transport::LocalListener::bind(&socket).expect("bind stub socket");
     tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
@@ -2597,8 +2604,8 @@ async fn watcher_reindexes_then_prunes_file_in_runtime_discovered_corpus_root() 
     let tmp = tempfile::tempdir().expect("tempdir");
     let ground = tmp.path().join("ground");
     let toml = format!(
-        "[embeddings]\nenabled = false\n\n[watch]\ndebounce_ms = 100\nreconcile_interval_secs = 3600\n\n[storage]\nground_dir = \"{g}\"\n",
-        g = ground.display(),
+        "[embeddings]\nenabled = false\n\n[watch]\ndebounce_ms = 100\nreconcile_interval_secs = 3600\n\n[storage]\nground_dir = {g}\n",
+        g = toml::Value::String(ground.display().to_string()),
     );
     let cfg: Config = toml::from_str(&toml).expect("parse cfg");
     let harness = DaemonHarness::spawn(cfg).await;
@@ -2611,8 +2618,8 @@ async fn watcher_reindexes_then_prunes_file_in_runtime_discovered_corpus_root() 
     std::fs::write(
         repo_root.join(".hallouminate/config.toml"),
         format!(
-            "[[corpus]]\nname = \"docs\"\npaths = [\"{}\"]\nglobs = [\"**/*.md\"]\n",
-            corpus_root.display()
+            "[[corpus]]\nname = \"docs\"\npaths = [{}]\nglobs = [\"**/*.md\"]\n",
+            toml::Value::String(corpus_root.display().to_string()),
         ),
     )
     .expect("write runtime repo config");
@@ -2950,9 +2957,9 @@ async fn reconcile_tick_repairs_dropped_remove_event() {
     let corpus_root = tmp.path().join("corpus");
     std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
     let toml = format!(
-        "[[corpus]]\nname = \"docs\"\npaths = [\"{c}\"]\nglobs = [\"**/*.md\"]\n\n[embeddings]\nenabled = false\n\n[watch]\ndebounce_ms = 100\nreconcile_interval_secs = 3600\n\n[storage]\nground_dir = \"{g}\"\n",
-        c = corpus_root.display(),
-        g = ground.display(),
+        "[[corpus]]\nname = \"docs\"\npaths = [{c}]\nglobs = [\"**/*.md\"]\n\n[embeddings]\nenabled = false\n\n[watch]\ndebounce_ms = 100\nreconcile_interval_secs = 3600\n\n[storage]\nground_dir = {g}\n",
+        c = toml::Value::String(corpus_root.display().to_string()),
+        g = toml::Value::String(ground.display().to_string()),
     );
     let cfg: Config = toml::from_str(&toml).expect("parse cfg");
     let watched = corpus_root.join("watched.md");
@@ -3039,17 +3046,17 @@ async fn reconcile_tick_repairs_dropped_remove_event() {
 
 fn cfg_request_scoped_corpora(ground: &Path) -> Config {
     let toml = format!(
-        "[storage]\nground_dir = \"{g}\"\n\n\
+        "[storage]\nground_dir = {g}\n\n\
          [embeddings]\nenabled = false\nmodel = \"BAAI/bge-small-en-v1.5\"\n",
-        g = ground.display(),
+        g = toml::Value::String(ground.display().to_string()),
     );
     toml::from_str(&toml).expect("request-scoped corpus baseline parses")
 }
 
 fn repo_corpus_cwd(cwd: &Path, root: &Path) -> PathBuf {
     let toml = format!(
-        "[[corpus]]\nname = \"docs\"\npaths = [\"{root}\"]\nglobs = [\"**/*.md\"]\n",
-        root = root.display(),
+        "[[corpus]]\nname = \"docs\"\npaths = [{root}]\nglobs = [\"**/*.md\"]\n",
+        root = toml::Value::String(root.display().to_string()),
     );
     repo_override_cwd(cwd, &toml)
 }
@@ -3395,8 +3402,8 @@ async fn daemon_ground_skips_repo_layer_corpus_outside_repo_root_with_warning() 
         &repo,
         &format!(
             "[[corpus]]\nname = \"local\"\npaths = [\"docs\"]\nglobs = [\"**/*.md\"]\n\n\
-             [[corpus]]\nname = \"hostile\"\npaths = [\"{}\"]\nglobs = [\"**/*.md\"]\n",
-            outside.display()
+             [[corpus]]\nname = \"hostile\"\npaths = [{}]\nglobs = [\"**/*.md\"]\n",
+            toml::Value::String(outside.display().to_string())
         ),
     );
 
@@ -3449,18 +3456,18 @@ fn cfg_two_root_corpus(ground: &Path, root_a: &Path, root_b: &Path) -> Config {
         r#"
 [[corpus]]
 name = "multi"
-paths = ["{a}", "{b}"]
+paths = [{a}, {b}]
 globs = ["**/*.md", "**/*.png"]
 
 [storage]
-ground_dir = "{g}"
+ground_dir = {g}
 
 [embeddings]
 enabled = false
 "#,
-        a = root_a.display(),
-        b = root_b.display(),
-        g = ground.display(),
+        a = toml::Value::String(root_a.display().to_string()),
+        b = toml::Value::String(root_b.display().to_string()),
+        g = toml::Value::String(ground.display().to_string()),
     );
     toml::from_str(&toml).expect("two-root corpus toml parses")
 }
@@ -3668,17 +3675,17 @@ fn cfg_single_root_corpus(ground: &Path, root: &Path) -> Config {
         r#"
 [[corpus]]
 name = "wiki"
-paths = ["{r}"]
+paths = [{r}]
 globs = ["**/*.md"]
 
 [storage]
-ground_dir = "{g}"
+ground_dir = {g}
 
 [embeddings]
 enabled = false
 "#,
-        r = root.display(),
-        g = ground.display(),
+        r = toml::Value::String(root.display().to_string()),
+        g = toml::Value::String(ground.display().to_string()),
     );
     toml::from_str(&toml).expect("single-root corpus toml parses")
 }
@@ -3711,6 +3718,9 @@ async fn daemon_read_markdown_citation_miss_suggests_bare_path() {
     let root = tmp.path().join("wiki");
     std::fs::create_dir_all(&root).expect("mkdir wiki");
     std::fs::write(root.join("notes.md"), "private-content-sentinel").expect("seed notes");
+    #[cfg(windows)]
+    std::fs::write(root.join("notes.md:12"), "private-content-sentinel")
+        .expect("seed alternate data stream");
     std::fs::write(root.join("other.md"), "other").expect("seed other");
     let harness =
         DaemonHarness::spawn(cfg_single_root_corpus(&tmp.path().join("ground"), &root)).await;
@@ -3789,7 +3799,12 @@ async fn daemon_read_markdown_citation_miss_rejects_invalid_suffixes() {
     ] {
         let message = read_miss_message(&client, harness.cwd(), path).await;
         assert!(
-            message.starts_with(&format!("{path} does not exist")),
+            message.starts_with(&format!("{path} does not exist"))
+                || (cfg!(windows)
+                    && message
+                        == hallouminate_domain::corpus::safe_relative_path(path)
+                            .expect_err("Windows must reject colon paths")
+                            .to_string()),
             "{message}"
         );
         assert!(!message.contains("Use path="), "{message}");
@@ -3797,6 +3812,7 @@ async fn daemon_read_markdown_citation_miss_rejects_invalid_suffixes() {
     }
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn daemon_read_markdown_citation_exact_colon_filename_wins() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -3857,7 +3873,8 @@ async fn daemon_read_markdown_citation_miss_preserves_path_protections() {
     }
     let message = read_miss_message(&client, harness.cwd(), "excluded.md:12").await;
     assert!(
-        message.starts_with("excluded.md:12 does not exist"),
+        message.starts_with("excluded.md:12 does not exist")
+            || (cfg!(windows) && message == "path contains a Windows reserved character"),
         "{message}"
     );
     assert!(!message.contains("Use path="), "{message}");
@@ -4136,23 +4153,23 @@ fn cfg_two_corpora_one_missing(
         r#"
 [[corpus]]
 name = "healthy"
-paths = ["{healthy}"]
+paths = [{healthy}]
 globs = ["**/*.md"]
 
 [[corpus]]
 name = "ghost"
-paths = ["{ghost}"]
+paths = [{ghost}]
 globs = ["**/*.md"]
 
 [storage]
-ground_dir = "{ground}"
+ground_dir = {ground}
 
 [embeddings]
 enabled = false
 "#,
-        healthy = healthy_root.display(),
-        ghost = ghost_root.display(),
-        ground = ground_dir.display(),
+        healthy = toml::Value::String(healthy_root.display().to_string()),
+        ghost = toml::Value::String(ghost_root.display().to_string()),
+        ground = toml::Value::String(ground_dir.display().to_string()),
     );
     toml::from_str(&toml).expect("two-corpora toml parses")
 }
@@ -4272,9 +4289,9 @@ async fn index_strict_aborts_on_missing_corpus_root() {
 /// Build a single-corpus daemon config with embeddings disabled.
 fn cfg_stale_corpus(ground: &Path, corpus_root: &Path) -> Config {
     let toml = format!(
-        "[[corpus]]\nname = \"docs\"\npaths = [\"{c}\"]\nglobs = [\"**/*.md\"]\n\n[storage]\nground_dir = \"{g}\"\n\n[embeddings]\nenabled = false\n\n[search]\ncold_wait_ms = 0\n",
-        c = corpus_root.display(),
-        g = ground.display(),
+        "[[corpus]]\nname = \"docs\"\npaths = [{c}]\nglobs = [\"**/*.md\"]\n\n[storage]\nground_dir = {g}\n\n[embeddings]\nenabled = false\n\n[search]\ncold_wait_ms = 0\n",
+        c = toml::Value::String(corpus_root.display().to_string()),
+        g = toml::Value::String(ground.display().to_string()),
     );
     toml::from_str(&toml).expect("stale corpus toml parses")
 }
@@ -4556,10 +4573,10 @@ async fn t20_mode_exclusivity_under_heading_plus_replace_lines_rejected() {
     let corpus_root = tmp.path().join("corpus");
     std::fs::create_dir_all(&corpus_root).expect("mkdir");
     let cfg: Config = toml::from_str(&format!(
-        "[[corpus]]\nname=\"docs\"\npaths=[\"{c}\"]\nglobs=[\"**/*.md\"]\n[storage]\nground_dir=\"{g}\"\n[embeddings]\nenabled=false",
-        c = corpus_root.display(),
-        g = ground.display()
-    ))
+"[[corpus]]\nname=\"docs\"\npaths=[{c}]\nglobs=[\"**/*.md\"]\n[storage]\nground_dir={g}\n[embeddings]\nenabled=false",
+c = toml::Value::String(corpus_root.display().to_string()),
+g = toml::Value::String(ground.display().to_string()),
+))
     .expect("cfg");
     let harness = DaemonHarness::spawn(cfg).await;
     let client = connect_at(harness.socket()).await.expect("connect");
@@ -4625,10 +4642,10 @@ async fn t21_mode_exclusivity_replace_lines_plus_replace_match_rejected() {
     let corpus_root = tmp.path().join("corpus");
     std::fs::create_dir_all(&corpus_root).expect("mkdir");
     let cfg: Config = toml::from_str(&format!(
-        "[[corpus]]\nname=\"docs\"\npaths=[\"{c}\"]\nglobs=[\"**/*.md\"]\n[storage]\nground_dir=\"{g}\"\n[embeddings]\nenabled=false",
-        c = corpus_root.display(),
-        g = ground.display()
-    ))
+"[[corpus]]\nname=\"docs\"\npaths=[{c}]\nglobs=[\"**/*.md\"]\n[storage]\nground_dir={g}\n[embeddings]\nenabled=false",
+c = toml::Value::String(corpus_root.display().to_string()),
+g = toml::Value::String(ground.display().to_string()),
+))
     .expect("cfg");
     let harness = DaemonHarness::spawn(cfg).await;
     let client = connect_at(harness.socket()).await.expect("connect");
@@ -4692,10 +4709,10 @@ async fn t22_under_heading_on_missing_file_returns_invalid_params() {
     let corpus_root = tmp.path().join("corpus");
     std::fs::create_dir_all(&corpus_root).expect("mkdir");
     let cfg: Config = toml::from_str(&format!(
-        "[[corpus]]\nname=\"docs\"\npaths=[\"{c}\"]\nglobs=[\"**/*.md\"]\n[storage]\nground_dir=\"{g}\"\n[embeddings]\nenabled=false",
-        c = corpus_root.display(),
-        g = ground.display()
-    ))
+"[[corpus]]\nname=\"docs\"\npaths=[{c}]\nglobs=[\"**/*.md\"]\n[storage]\nground_dir={g}\n[embeddings]\nenabled=false",
+c = toml::Value::String(corpus_root.display().to_string()),
+g = toml::Value::String(ground.display().to_string()),
+))
     .expect("cfg");
     let harness = DaemonHarness::spawn(cfg).await;
     let client = connect_at(harness.socket()).await.expect("connect");
@@ -4740,10 +4757,10 @@ async fn t23_replace_lines_on_missing_file_returns_invalid_params() {
     let corpus_root = tmp.path().join("corpus");
     std::fs::create_dir_all(&corpus_root).expect("mkdir");
     let cfg: Config = toml::from_str(&format!(
-        "[[corpus]]\nname=\"docs\"\npaths=[\"{c}\"]\nglobs=[\"**/*.md\"]\n[storage]\nground_dir=\"{g}\"\n[embeddings]\nenabled=false",
-        c = corpus_root.display(),
-        g = ground.display()
-    ))
+"[[corpus]]\nname=\"docs\"\npaths=[{c}]\nglobs=[\"**/*.md\"]\n[storage]\nground_dir={g}\n[embeddings]\nenabled=false",
+c = toml::Value::String(corpus_root.display().to_string()),
+g = toml::Value::String(ground.display().to_string()),
+))
     .expect("cfg");
     let harness = DaemonHarness::spawn(cfg).await;
     let client = connect_at(harness.socket()).await.expect("connect");
@@ -4788,10 +4805,10 @@ async fn t24_replace_match_on_missing_file_returns_invalid_params() {
     let corpus_root = tmp.path().join("corpus");
     std::fs::create_dir_all(&corpus_root).expect("mkdir");
     let cfg: Config = toml::from_str(&format!(
-        "[[corpus]]\nname=\"docs\"\npaths=[\"{c}\"]\nglobs=[\"**/*.md\"]\n[storage]\nground_dir=\"{g}\"\n[embeddings]\nenabled=false",
-        c = corpus_root.display(),
-        g = ground.display()
-    ))
+"[[corpus]]\nname=\"docs\"\npaths=[{c}]\nglobs=[\"**/*.md\"]\n[storage]\nground_dir={g}\n[embeddings]\nenabled=false",
+c = toml::Value::String(corpus_root.display().to_string()),
+g = toml::Value::String(ground.display().to_string()),
+))
     .expect("cfg");
     let harness = DaemonHarness::spawn(cfg).await;
     let client = connect_at(harness.socket()).await.expect("connect");
@@ -4837,10 +4854,10 @@ async fn t25_section_write_reindexes_file() {
     let corpus_root = tmp.path().join("corpus");
     std::fs::create_dir_all(&corpus_root).expect("mkdir");
     let cfg: Config = toml::from_str(&format!(
-        "[[corpus]]\nname=\"docs\"\npaths=[\"{c}\"]\nglobs=[\"**/*.md\"]\n[storage]\nground_dir=\"{g}\"\n[embeddings]\nenabled=false",
-        c = corpus_root.display(),
-        g = ground.display()
-    ))
+"[[corpus]]\nname=\"docs\"\npaths=[{c}]\nglobs=[\"**/*.md\"]\n[storage]\nground_dir={g}\n[embeddings]\nenabled=false",
+c = toml::Value::String(corpus_root.display().to_string()),
+g = toml::Value::String(ground.display().to_string()),
+))
     .expect("cfg");
     let harness = DaemonHarness::spawn(cfg).await;
     let client = connect_at(harness.socket()).await.expect("connect");
@@ -4907,10 +4924,10 @@ async fn t26_replace_lines_write_reindexes_file() {
     let corpus_root = tmp.path().join("corpus");
     std::fs::create_dir_all(&corpus_root).expect("mkdir");
     let cfg: Config = toml::from_str(&format!(
-        "[[corpus]]\nname=\"docs\"\npaths=[\"{c}\"]\nglobs=[\"**/*.md\"]\n[storage]\nground_dir=\"{g}\"\n[embeddings]\nenabled=false",
-        c = corpus_root.display(),
-        g = ground.display()
-    ))
+"[[corpus]]\nname=\"docs\"\npaths=[{c}]\nglobs=[\"**/*.md\"]\n[storage]\nground_dir={g}\n[embeddings]\nenabled=false",
+c = toml::Value::String(corpus_root.display().to_string()),
+g = toml::Value::String(ground.display().to_string()),
+))
     .expect("cfg");
     let harness = DaemonHarness::spawn(cfg).await;
     let client = connect_at(harness.socket()).await.expect("connect");
@@ -4972,10 +4989,10 @@ async fn t27_whole_file_write_with_new_fields_omitted_is_unchanged() {
     let corpus_root = tmp.path().join("corpus");
     std::fs::create_dir_all(&corpus_root).expect("mkdir");
     let cfg: Config = toml::from_str(&format!(
-        "[[corpus]]\nname=\"docs\"\npaths=[\"{c}\"]\nglobs=[\"**/*.md\"]\n[storage]\nground_dir=\"{g}\"\n[embeddings]\nenabled=false",
-        c = corpus_root.display(),
-        g = ground.display()
-    ))
+"[[corpus]]\nname=\"docs\"\npaths=[{c}]\nglobs=[\"**/*.md\"]\n[storage]\nground_dir={g}\n[embeddings]\nenabled=false",
+c = toml::Value::String(corpus_root.display().to_string()),
+g = toml::Value::String(ground.display().to_string()),
+))
     .expect("cfg");
     let harness = DaemonHarness::spawn(cfg).await;
     let client = connect_at(harness.socket()).await.expect("connect");
@@ -5023,10 +5040,10 @@ async fn t28_edit_mode_lint_warnings_ride_back_on_composed_file() {
     let corpus_root = tmp.path().join("corpus");
     std::fs::create_dir_all(&corpus_root).expect("mkdir");
     let cfg: Config = toml::from_str(&format!(
-        "[[corpus]]\nname=\"docs\"\npaths=[\"{c}\"]\nglobs=[\"**/*.md\"]\n[storage]\nground_dir=\"{g}\"\n[embeddings]\nenabled=false",
-        c = corpus_root.display(),
-        g = ground.display()
-    ))
+"[[corpus]]\nname=\"docs\"\npaths=[{c}]\nglobs=[\"**/*.md\"]\n[storage]\nground_dir={g}\n[embeddings]\nenabled=false",
+c = toml::Value::String(corpus_root.display().to_string()),
+g = toml::Value::String(ground.display().to_string()),
+))
     .expect("cfg");
     let harness = DaemonHarness::spawn(cfg).await;
     let client = connect_at(harness.socket()).await.expect("connect");
@@ -5108,11 +5125,11 @@ fn write_stale_meta(ground_dir: &Path, schema_version: u32) {
 /// matches the `write_stale_meta` sidecar (both must agree on model name).
 fn cfg_with_corpus(ground_dir: &Path, corpus_root: &Path) -> Config {
     let toml = format!(
-        "[[corpus]]\nname = \"docs\"\npaths = [\"{c}\"]\nglobs = [\"**/*.md\"]\n\n\
-         [storage]\nground_dir = \"{g}\"\n\n\
+        "[[corpus]]\nname = \"docs\"\npaths = [{c}]\nglobs = [\"**/*.md\"]\n\n\
+         [storage]\nground_dir = {g}\n\n\
          [embeddings]\nenabled = false\nmodel = \"BAAI/bge-small-en-v1.5\"\n",
-        c = corpus_root.display(),
-        g = ground_dir.display(),
+        c = toml::Value::String(corpus_root.display().to_string()),
+        g = toml::Value::String(ground_dir.display().to_string()),
     );
     toml::from_str(&toml).expect("cfg_with_corpus toml parses")
 }
@@ -5384,11 +5401,11 @@ async fn stale_v3_daemon_startup_failure_warns_and_preserves_backup() {
     write_stale_meta(&ground, 3);
 
     let toml = format!(
-        "[[corpus]]\nname = \"docs\"\npaths = [\"{c}\"]\nglobs = [\"[invalid\"]\n\n\
-         [storage]\nground_dir = \"{g}\"\n\n\
+        "[[corpus]]\nname = \"docs\"\npaths = [{c}]\nglobs = [\"[invalid\"]\n\n\
+         [storage]\nground_dir = {g}\n\n\
          [embeddings]\nenabled = false\nmodel = \"BAAI/bge-small-en-v1.5\"\n",
-        c = corpus_root.display(),
-        g = ground.display(),
+        c = toml::Value::String(corpus_root.display().to_string()),
+        g = toml::Value::String(ground.display().to_string()),
     );
     let cfg: Config = toml::from_str(&toml).expect("toml parses");
     let logs = capture_daemon_warnings(|| async move {
@@ -5446,8 +5463,8 @@ async fn daemon_returns_structured_error_when_request_line_exceeds_cap() {
     // bare transport EOF with no error payload (a legitimate oversized
     // `add_markdown.content` write would otherwise look identical to a
     // crashed connection).
+    use hallouminate_daemon::transport::LocalStream as UnixStream;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader as TokioBufReader};
-    use tokio::net::UnixStream;
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let ground = tmp.path().join("ground");
@@ -5526,7 +5543,7 @@ async fn ipc_shutdown_waits_for_in_flight_handler_before_releasing_socket() {
     // until the per-connection idle timeout elapses, giving us a real
     // in-flight handler without any test-only injection seam.
     use hallouminate_daemon::serve_with_idle_timeout;
-    use tokio::net::UnixStream;
+    use hallouminate_daemon::transport::LocalStream as UnixStream;
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let ground = tmp.path().join("ground");
@@ -5629,9 +5646,9 @@ async fn resources_for_observes_repo_layer_embeddings_enabled_override_without_r
     std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
     let ground = tmp.path().join("ground");
     let toml = format!(
-        "[[corpus]]\nname = \"docs\"\npaths = [\"{c}\"]\nglobs = [\"**/*.md\"]\n\n[storage]\nground_dir = \"{g}\"\n",
-        c = corpus_root.display(),
-        g = ground.display(),
+        "[[corpus]]\nname = \"docs\"\npaths = [{c}]\nglobs = [\"**/*.md\"]\n\n[storage]\nground_dir = {g}\n",
+        c = toml::Value::String(corpus_root.display().to_string()),
+        g = toml::Value::String(ground.display().to_string()),
     );
     let cfg: Config = toml::from_str(&toml).expect("parse cfg");
     // Baseline config leaves `[embeddings]` unset, so `enabled` defaults to
@@ -5710,9 +5727,9 @@ async fn resources_for_observes_repo_layer_embeddings_model_override_without_res
     std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
     let ground = tmp.path().join("ground");
     let toml = format!(
-        "[[corpus]]\nname = \"docs\"\npaths = [\"{c}\"]\nglobs = [\"**/*.md\"]\n\n[storage]\nground_dir = \"{g}\"\n\n[embeddings]\nenabled = false\n",
-        c = corpus_root.display(),
-        g = ground.display(),
+        "[[corpus]]\nname = \"docs\"\npaths = [{c}]\nglobs = [\"**/*.md\"]\n\n[storage]\nground_dir = {g}\n\n[embeddings]\nenabled = false\n",
+        c = toml::Value::String(corpus_root.display().to_string()),
+        g = toml::Value::String(ground.display().to_string()),
     );
     let cfg: Config = toml::from_str(&toml).expect("parse cfg");
     // Baseline leaves `embeddings.model` unset (default: snowflake-arctic-embed-s),
@@ -5838,8 +5855,8 @@ async fn rebuild_wiki_indexes_uses_per_request_embedder_not_baseline() {
     let override_cwd = repo_override_cwd(
         &tmp.path().join("override"),
         &format!(
-            "[storage]\nground_dir = \"{g}\"\n\n[embeddings]\nmodel = \"BAAI/bge-small-en-v1.5\"\n",
-            g = ground_override.display(),
+            "[storage]\nground_dir = {g}\n\n[embeddings]\nmodel = \"BAAI/bge-small-en-v1.5\"\n",
+            g = toml::Value::String(ground_override.display().to_string()),
         ),
     );
 
@@ -5882,15 +5899,15 @@ async fn daemon_markdown_batch_enforces_bounds_before_side_effects() {
         r#"
 [[corpus]]
 name = "docs"
-paths = ["{}"]
+paths = [{}]
 globs = ["**/*.md"]
 [storage]
-ground_dir = "{}"
+ground_dir = {}
 [embeddings]
 enabled = false
 "#,
-        root.display(),
-        tmp.path().join("ground").display()
+        toml::Value::String(root.display().to_string()),
+        toml::Value::String(tmp.path().join("ground").display().to_string()),
     ))
     .expect("config");
     let harness = DaemonHarness::spawn(cfg).await;
@@ -5964,22 +5981,22 @@ async fn daemon_markdown_batch_retains_exclusion_and_multi_root_guards() {
         r#"
 [[corpus]]
 name = "excluded"
-paths = ["{}"]
+paths = [{}]
 globs = ["**/*.md"]
 exclude = ["private/**"]
 [[corpus]]
 name = "multi"
-paths = ["{}", "{}"]
+paths = [{}, {}]
 globs = ["**/*.md"]
 [storage]
-ground_dir = "{}"
+ground_dir = {}
 [embeddings]
 enabled = false
 "#,
-        first.display(),
-        first.display(),
-        second.display(),
-        tmp.path().join("ground").display()
+        toml::Value::String(first.display().to_string()),
+        toml::Value::String(first.display().to_string()),
+        toml::Value::String(second.display().to_string()),
+        toml::Value::String(tmp.path().join("ground").display().to_string()),
     ))
     .expect("config");
     let harness = DaemonHarness::spawn(cfg).await;
@@ -6058,17 +6075,17 @@ async fn daemon_add_markdown_deep_page_reindexes_ancestors_in_one_commit() {
         r#"
 [[repository]]
 name = "myrepo"
-path = "{r}"
+path = {r}
 
 [storage]
-ground_dir = "{g}"
+ground_dir = {g}
 
 [embeddings]
 enabled = false
 model = "BAAI/bge-small-en-v1.5"
 "#,
-        r = repo.display(),
-        g = ground.display(),
+        r = toml::Value::String(repo.display().to_string()),
+        g = toml::Value::String(ground.display().to_string()),
     );
     let cfg: Config = toml::from_str(&toml).expect("cfg parses");
     let harness = DaemonHarness::spawn(cfg).await;

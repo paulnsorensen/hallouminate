@@ -319,7 +319,9 @@ pub fn list_corpus_files(corpus: &CorpusConfig) -> anyhow::Result<Vec<FileEntry>
                 .find_map(|r| absolute.strip_prefix(r).ok())
                 .unwrap_or(absolute.as_path());
             FileEntry {
-                path: relative.to_string_lossy().into_owned(),
+                path: relative
+                    .to_string_lossy()
+                    .replace(std::path::MAIN_SEPARATOR, "/"),
                 absolute_path: absolute.to_string_lossy().into_owned(),
             }
         })
@@ -1137,27 +1139,23 @@ fn write_and_sync_cap(file: &mut cap_std::fs::File, content: &[u8]) -> Result<()
 }
 
 fn fsync_dir(dir: &Dir) -> Result<(), WriteError> {
-    // `cap_std::fs::Dir` has no `sync_all` method, and its underlying
-    // `std::fs::File` is opened with `O_PATH` on Linux (cap-std's dir-open
-    // optimisation for `*at`-only handles). `O_PATH` fds cannot be fsync'd
-    // — `sync_all` on one returns `EBADF`. Re-open `.` through the
-    // capability with `read(true)` to get a regular RDONLY fd; cap-std's
-    // path-resolver special-cases the trailing `.` and re-opens with the
-    // user-supplied options, so the resulting handle supports `sync_all`.
-    // (Confirmed against cap-primitives' `internal_open::follow_with_dot`
-    // branch.) Stays cross-platform — Windows accepts `sync_all` on the
-    // dir handle either way.
-    //
-    // Cost vs pre-migration: two extra syscalls per write (`open(".")` +
-    // drop) on top of the `sync_all`. `atomic_write_no_follow` is the
-    // markdown-write hot path; the overhead has been measured as invisible
-    // here. Revisit only if a future profile flags it.
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use cap_std::fs::OpenOptionsExt;
+        use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+        options
+            .access_mode(GENERIC_READ | GENERIC_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+    }
     let dot = dir
-        .open(".")
-        .map_err(|e| WriteError::new(WriteErrorKind::Io, e))?;
+        .open_with(".", &options)
+        .map_err(|error| WriteError::new(WriteErrorKind::Io, error))?;
     dot.into_std()
         .sync_all()
-        .map_err(|e| WriteError::new(WriteErrorKind::Io, e))
+        .map_err(|error| WriteError::new(WriteErrorKind::Io, error))
 }
 
 #[cfg(unix)]
@@ -1264,6 +1262,22 @@ mod tests {
 
     use super::*;
 
+    fn symlink(target: impl AsRef<Path>, link: impl AsRef<Path>) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link)
+        }
+        #[cfg(windows)]
+        {
+            let target = target.as_ref();
+            if target.is_dir() {
+                std::os::windows::fs::symlink_dir(target, link)
+            } else {
+                std::os::windows::fs::symlink_file(target, link)
+            }
+        }
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_paths_reject_device_names_streams_and_aliases() {
@@ -1321,6 +1335,22 @@ mod tests {
             let error = classify_create_io_error(std::io::Error::from_raw_os_error(code as i32));
             assert_eq!(error.kind, WriteErrorKind::InvalidPath);
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_no_follow_open_of_symlink_is_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("real.md"), "# Real").unwrap();
+        symlink(tmp.path().join("real.md"), tmp.path().join("link.md")).unwrap();
+        let Err(error) = open_existing_file_no_follow(tmp.path(), Path::new("link.md")) else {
+            panic!("open followed a symlink");
+        };
+        assert_eq!(error.kind, WriteErrorKind::Symlink);
+        let Err(error) = read_no_follow(tmp.path(), Path::new("link.md")) else {
+            panic!("read followed a symlink");
+        };
+        assert_eq!(error.kind, WriteErrorKind::Symlink);
     }
 
     fn cfg(name: &str, paths: Vec<&str>) -> CorpusConfig {
@@ -1537,7 +1567,7 @@ mod tests {
         let real_root = tmp.path().join("real-root");
         std::fs::create_dir(&real_root).unwrap();
         let root = tmp.path().join("root-link");
-        std::os::unix::fs::symlink(&real_root, &root).unwrap();
+        symlink(&real_root, &root).unwrap();
 
         let corpus = cfg("docs", vec![root.to_str().unwrap()]);
         let dest = root.join("new-page.md");
@@ -1553,7 +1583,7 @@ mod tests {
         let real_parent = tmp.path().join("real-parent");
         std::fs::create_dir(&real_parent).unwrap();
         let parent_link = tmp.path().join("parent-link");
-        std::os::unix::fs::symlink(&real_parent, &parent_link).unwrap();
+        symlink(&real_parent, &parent_link).unwrap();
 
         let root = parent_link.join("missing").join("root");
         let corpus = cfg("docs", vec![root.to_str().unwrap()]);
@@ -1600,7 +1630,7 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         let outside = tmp.path().join("outside");
         std::fs::create_dir(&outside).unwrap();
-        std::os::unix::fs::symlink(&outside, root.join("escape")).unwrap();
+        symlink(&outside, root.join("escape")).unwrap();
 
         let err = atomic_write_no_follow(&root, Path::new("escape/pwned.md"), b"x", false)
             .expect_err("symlinked intermediate dir must bounce");
@@ -1621,7 +1651,7 @@ mod tests {
         let outside = tmp.path().parent().unwrap().join("outside-leaf");
         let _ = std::fs::remove_file(&outside);
         std::fs::write(&outside, b"original").unwrap();
-        std::os::unix::fs::symlink(&outside, root.join("link.md")).unwrap();
+        symlink(&outside, root.join("link.md")).unwrap();
 
         let err = atomic_write_no_follow(root, Path::new("link.md"), b"new", true)
             .expect_err("final symlink must bounce");
@@ -1639,7 +1669,7 @@ mod tests {
         let outside = tmp.path().join("outside");
         std::fs::create_dir(&outside).unwrap();
         let root = tmp.path().join("root");
-        std::os::unix::fs::symlink(&outside, &root).unwrap();
+        symlink(&outside, &root).unwrap();
 
         let err = atomic_write_no_follow(&root, Path::new("pwned.md"), b"x", false)
             .expect_err("symlinked corpus root must bounce");
@@ -1650,6 +1680,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn atomic_write_no_follow_overwrite_preserves_destination_mode() {
         use std::os::unix::fs::PermissionsExt;
@@ -1679,6 +1710,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn atomic_write_no_follow_new_file_gets_configured_safe_mode() {
         use std::os::unix::fs::PermissionsExt;
@@ -1749,13 +1781,12 @@ mod tests {
         // not `Io` — so the public `WriteErrorKind` contract matches the
         // pre-migration `cstring()`-based rejection.
         use std::ffi::OsString;
-        use std::os::unix::ffi::OsStringExt;
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         // A filename literally containing a NUL byte. Bypasses
         // `safe_relative_path`'s string-level check by constructing
         // straight from raw bytes.
-        let nul_name = OsString::from_vec(b"bad\0name.md".to_vec());
+        let nul_name = OsString::from("bad\0name.md");
         let rel = PathBuf::from(nul_name);
         let err = atomic_write_no_follow(root, &rel, b"x", false)
             .expect_err("NUL in component must fail");
@@ -1814,7 +1845,7 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         let target = root.join("real.md");
         std::fs::write(&target, b"target\n").unwrap();
-        std::os::unix::fs::symlink(&target, root.join("link.md")).unwrap();
+        symlink(&target, root.join("link.md")).unwrap();
         let err =
             read_no_follow(&root, Path::new("link.md")).expect_err("symlinked leaf must bounce");
         assert!(matches!(err.kind, WriteErrorKind::Symlink), "{err:?}");
@@ -1833,7 +1864,7 @@ mod tests {
         let outside = tmp.path().join("outside");
         std::fs::create_dir(&outside).unwrap();
         std::fs::write(outside.join("secret.md"), b"shh\n").unwrap();
-        std::os::unix::fs::symlink(&outside, root.join("escape")).unwrap();
+        symlink(&outside, root.join("escape")).unwrap();
         let err = read_no_follow(&root, Path::new("escape/secret.md"))
             .expect_err("intermediate symlink must bounce");
         assert!(matches!(err.kind, WriteErrorKind::Symlink), "{err:?}");
@@ -1877,7 +1908,7 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         std::fs::create_dir(&outside).unwrap();
         std::fs::write(outside.join("secret.md"), b"shh\n").unwrap();
-        std::os::unix::fs::symlink(&outside, root.join("docs")).unwrap();
+        symlink(&outside, root.join("docs")).unwrap();
         let err = open_existing_file_no_follow(&root, Path::new("docs/secret.md"))
             .expect_err("swapped parent must bounce");
         assert!(matches!(err.kind, WriteErrorKind::Symlink), "{err:?}");
@@ -1892,6 +1923,7 @@ mod tests {
         assert!(!tmp.path().join("missing").exists(), "parent was created");
     }
 
+    #[cfg(unix)]
     #[test]
     fn open_existing_file_no_follow_rejects_a_fifo_leaf_without_blocking() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1995,7 +2027,7 @@ mod tests {
         std::fs::create_dir_all(&second).unwrap();
         let outside = tmp.path().join("outside.md");
         std::fs::write(&outside, b"secret\n").unwrap();
-        std::os::unix::fs::symlink(&outside, first.join("link.md")).unwrap();
+        symlink(&outside, first.join("link.md")).unwrap();
         std::fs::write(second.join("link.md"), b"real\n").unwrap();
         let corpus = cfg(
             "docs",
@@ -2059,7 +2091,7 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         let target = tmp.path().join("target.md");
         std::fs::write(&target, b"keep me\n").unwrap();
-        std::os::unix::fs::symlink(&target, root.join("link.md")).unwrap();
+        symlink(&target, root.join("link.md")).unwrap();
         let err =
             delete_no_follow(&root, Path::new("link.md")).expect_err("symlinked leaf must bounce");
         assert!(matches!(err.kind, WriteErrorKind::Symlink), "{err:?}");
@@ -2080,7 +2112,7 @@ mod tests {
         let outside = tmp.path().join("outside");
         std::fs::create_dir(&outside).unwrap();
         std::fs::write(outside.join("victim.md"), b"keep\n").unwrap();
-        std::os::unix::fs::symlink(&outside, root.join("escape")).unwrap();
+        symlink(&outside, root.join("escape")).unwrap();
         let err = delete_no_follow(&root, Path::new("escape/victim.md"))
             .expect_err("intermediate symlink must bounce");
         assert!(matches!(err.kind, WriteErrorKind::Symlink), "{err:?}");
