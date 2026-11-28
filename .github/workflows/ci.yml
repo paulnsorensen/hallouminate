@@ -245,14 +245,15 @@ jobs:
   # Aggregation gate: the branch ruleset requires a single status check named
   # "build & test", but the matrix expands to "build & test (ubuntu-latest)" etc.
   # This job collapses the matrix into one required context and fails unless
-  # every matrix leg succeeded — so the required check stays stable when the
-  # matrix gains or loses an OS.
+  # the build-test matrix, the Windows job, the verification-lease matrix, and
+  # the npm-installer matrix all succeeded — so the required check stays stable
+  # when a matrix gains or loses an OS. The needs list is the only job list.
   build-test:
     name: build & test
-    needs: build-test-matrix
+    needs: [build-test-matrix, windows, verification-lease, npm-installer]
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - name: Require all matrix legs to pass
-        if: needs.build-test-matrix.result != 'success'
+      - name: Require all gated jobs to pass
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped')
         run: exit 1
