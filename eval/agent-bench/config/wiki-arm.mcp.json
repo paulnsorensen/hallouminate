@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "hallouminate": {
+      "command": "/opt/hallouminate",
+      "args": ["serve"]
+    }
+  }
+}
