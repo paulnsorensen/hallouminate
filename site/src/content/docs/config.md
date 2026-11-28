@@ -63,11 +63,19 @@ so the wiki lands at `<repo>/.hallouminate/wiki` and is searchable as
 
 ## Logging
 
-The active process log uses the build channel's app directory:
-`$XDG_STATE_HOME/hallouminate/hallouminate.log` for release builds and
-`$XDG_STATE_HOME/hallouminate-dev/hallouminate.log` for dev builds.
-When `XDG_STATE_HOME` is unset, the base is `~/.local/state`.
-Size rotation creates numbered archives `hallouminate.log.1`, `.2`, and so on, with `.1` newest.
+Each process uses its own log file in the build channel's state directory.
+Release builds use `$XDG_STATE_HOME/hallouminate/`. Dev builds use
+`$XDG_STATE_HOME/hallouminate-dev/`. If `XDG_STATE_HOME` is unset, the base
+is `~/.local/state`. Only one process writes each file:
+
+| Process | Log file |
+|---|---|
+| Daemon | `daemon.log` (`daemon-<pid>.log` if another live daemon holds `daemon.log`) |
+| MCP stdio server (`hallouminate serve`) | `serve-<pid>.log` |
+| Any other CLI command | `cli-<pid>.log`, created only when the command logs |
+
+A file rotates before a record would take it past `max_file_bytes`. Archives
+are `<name>.log.1`, `.2`, and so on. The highest number is the newest.
 
 ```toml
 [logging]
@@ -75,10 +83,25 @@ max_file_bytes = 10485760   # 10 MiB
 max_total_bytes = 104857600 # 100 MiB
 ```
 
-Every active or archived file is capped at `max_file_bytes`. Retention keeps at
-most `floor(max_total_bytes / max_file_bytes)` files including the active file,
-so defaults retain the active file plus nine archives and never exceed 100 MiB.
+`max_total_bytes` bounds all of these files together, plus legacy
+`hallouminate.log` and `hallouminate.log.N` files from older versions. At
+startup and after each rotation, a process removes oversized archives it owns
+or can claim. It then deletes eligible files oldest-first until the directory
+has room for one more full file. It does not delete its active file or files
+of another live process. If a prior active file exceeds a lowered file limit,
+it rotates before the next valid record and its oversized archive is removed.
+Each writer holds an advisory lock on `<name>.log.lock` while it runs. A stable
+per-directory lock serializes retention passes across processes. Live files of
+other processes can keep the total above the limit until those processes exit.
+Records larger than `max_file_bytes` are dropped without stderr payload output.
 Both limits must be nonzero and the total must be at least the per-file limit.
+New process logs and bootstrap captures are owner-only on Unix. Existing file
+permissions are not changed. Stored diagnostics can contain sensitive panic
+payloads.
+
+A panic in any thread is logged as an `ERROR` event with target
+`hallouminate::panic`. The event carries the thread name, location, payload,
+and a backtrace. The panic message also still goes to stderr.
 
 `HALLOUMINATE_LOG_MAX_FILE_BYTES` and
 `HALLOUMINATE_LOG_MAX_TOTAL_BYTES` override the baseline limits. Invalid values
@@ -140,8 +163,8 @@ hallouminate config download
 |---|---|
 | Baseline config | `$XDG_CONFIG_HOME/hallouminate/config.toml` |
 | Repo-layer config | `<repo>/.hallouminate/config.toml` |
-| Active process log | `$XDG_STATE_HOME/hallouminate/hallouminate.log` (state-dir fallback) |
-| Rotated process logs | `hallouminate.log.1` through `.9` with default limits |
+| Process logs | `$XDG_STATE_HOME/hallouminate/`: `daemon.log`, `serve-<pid>.log`, `cli-<pid>.log` |
+| Rotated process logs | `<name>.log.1`, `.2`, and so on. The highest number is the newest. |
 | Ground (LanceDB) directory | `~/.local/share/hallouminate/ground` |
 | Model cache | `~/.cache/hallouminate/fastembed` |
 | Daemon socket | `<account-home>/.cache/hallouminate/daemon.sock` |
@@ -184,6 +207,7 @@ A dev build replaces the `hallouminate` directory name with
 |---|---|---|
 | Ground (LanceDB) directory | `~/.local/share/hallouminate/ground` | `~/.local/share/hallouminate-dev/ground` |
 | Daemon socket | `<account-home>/.cache/hallouminate/daemon.sock` | `<account-home>/.cache/hallouminate-dev/daemon.sock` |
+| Process log directory | `$XDG_STATE_HOME/hallouminate/` | `$XDG_STATE_HOME/hallouminate-dev/` |
 | Daemon bootstrap log | `$XDG_STATE_HOME/hallouminate/daemon-bootstrap.log` | `$XDG_STATE_HOME/hallouminate-dev/daemon-bootstrap.log` |
 
 The watchdog trip file is next to the socket, so it also moves.
@@ -198,9 +222,9 @@ These items do not change:
   An intentional custom `[storage].ground_dir` also stays unchanged.
   A dev build remaps the legacy built-in release `ground_dir` default to its
   dev directory, whether the path uses `~` or an expanded home directory.
-- `XDG_STATE_HOME` sets only the state directory base. The build channel
-  selects `hallouminate` or `hallouminate-dev` below that base, including
-  the active process log.
+- `XDG_STATE_HOME` sets the state directory base. The build channel selects
+  `hallouminate` or `hallouminate-dev` below it for the process logs and
+  the daemon bootstrap log.
 
 The first dev build on a host starts with an empty store. Run
 `hallouminate index` to fill it.
