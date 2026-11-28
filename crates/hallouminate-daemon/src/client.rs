@@ -7,7 +7,7 @@
 //! explicitly; the client never auto-starts a daemon.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use futures_util::StreamExt;
@@ -18,6 +18,7 @@ use tokio::net::UnixStream;
 use super::bootstrap::ensure_daemon_running;
 use super::framing::{MAX_IPC_LINE_BYTES, ipc_lines};
 use super::ipc::{DaemonRequest, DaemonRequestPayload, DaemonResponse, ErrorKind};
+use super::oplog::{Answer, ClientCall, Outcome, Reason};
 use super::socket::daemon_socket_path;
 
 /// Client handle: just remembers which socket path to dial. Stateless
@@ -118,6 +119,13 @@ impl DaemonClient {
     /// Send one request, parse one response. The daemon protocol is
     /// one-shot per connection, so each call opens a new socket.
     pub async fn call_raw(&self, req: DaemonRequest) -> anyhow::Result<DaemonResponse> {
+        let (response, _response_bytes) = self.call_raw_sized(req).await?;
+        Ok(response)
+    }
+
+    /// [`DaemonClient::call_raw`] that also returns the byte length of the
+    /// response line.
+    async fn call_raw_sized(&self, req: DaemonRequest) -> anyhow::Result<(DaemonResponse, u64)> {
         let mut text = serde_json::to_string(&req)?;
         text.push('\n');
         if let DaemonRequestPayload::AddMarkdownBatch { .. } = &req.payload
@@ -160,7 +168,8 @@ impl DaemonClient {
                 self.socket.display(),
             ))
         })?;
-        Ok(response)
+        let response_bytes = u64::try_from(line.len()).unwrap_or(u64::MAX);
+        Ok((response, response_bytes))
     }
 
     /// [`call_raw`] with a bounded round-trip deadline. `call_raw` itself
@@ -181,18 +190,75 @@ impl DaemonClient {
         req: DaemonRequest,
         timeout: Duration,
     ) -> anyhow::Result<DaemonResponse> {
+        let TimedCall { result, .. } = self.timed_call(req, timeout).await;
+        result
+    }
+
+    /// [`DaemonClient::call_raw_with_timeout`] that sends the request id of
+    /// `call` and records the outcome and the answer on `call`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`DaemonClient::call_raw_with_timeout`].
+    pub async fn call_raw_with_timeout_logged(
+        &self,
+        req: DaemonRequest,
+        timeout: Duration,
+        call: &mut ClientCall,
+    ) -> anyhow::Result<DaemonResponse> {
+        let req = req.with_request_id(call.request_id().clone());
+        let TimedCall {
+            result,
+            outcome,
+            answer,
+        } = self.timed_call(req, timeout).await;
+        call.record(outcome, answer);
+        result
+    }
+
+    async fn timed_call(&self, req: DaemonRequest, timeout: Duration) -> TimedCall {
         let mut timeout_hint = "the daemon may be busy — retry";
         if let DaemonRequestPayload::AddMarkdownBatch { .. } = &req.payload {
             timeout_hint = "batch completion is uncertain; inspect files before retrying. No automatic retry or rollback occurred";
         }
-        match tokio::time::timeout(timeout, self.call_raw(req)).await {
-            Ok(result) => result,
-            Err(_elapsed) => Err(DaemonRpcError::retryable(format!(
-                "no response from {} within {}s; {timeout_hint}",
-                self.socket.display(),
-                timeout.as_secs(),
-            ))
-            .into()),
+        let start = Instant::now();
+        match tokio::time::timeout(timeout, self.call_raw_sized(req)).await {
+            Ok(Ok((response, response_bytes))) => {
+                let answer = Answer {
+                    round_trip: start.elapsed(),
+                    response_bytes,
+                };
+                let outcome = match &response {
+                    DaemonResponse::Ok { .. } => Outcome::Ok,
+                    DaemonResponse::Err { kind, .. } => kind_outcome(*kind),
+                };
+                TimedCall {
+                    result: Ok(response),
+                    outcome,
+                    answer: Some(answer),
+                }
+            }
+            Ok(Err(error)) => {
+                let outcome = match error.downcast_ref::<DaemonRpcError>() {
+                    Some(rpc) => kind_outcome(rpc.kind),
+                    None => Outcome::Unavailable,
+                };
+                TimedCall {
+                    result: Err(error),
+                    outcome,
+                    answer: None,
+                }
+            }
+            Err(_elapsed) => TimedCall {
+                result: Err(DaemonRpcError::retryable(format!(
+                    "no response from {} within {}s; {timeout_hint}",
+                    self.socket.display(),
+                    timeout.as_secs(),
+                ))
+                .into()),
+                outcome: Outcome::Cancelled(Reason::Timeout),
+                answer: None,
+            },
         }
     }
 
@@ -203,15 +269,51 @@ impl DaemonClient {
     /// would hang the caller forever on a wedged daemon (issue #216).
     pub async fn call<T: DeserializeOwned>(&self, req: DaemonRequest) -> anyhow::Result<T> {
         let timeout = timeout_for(&req.payload);
-        match self.call_raw_with_timeout(req, timeout).await? {
-            DaemonResponse::Ok { result } => serde_json::from_value(result)
-                .map_err(|e| anyhow::anyhow!("daemon returned unexpected payload: {e}")),
-            DaemonResponse::Err { kind, message } => match kind {
-                ErrorKind::InvalidParams => Err(DaemonRpcError::invalid_params(message).into()),
-                ErrorKind::Internal => Err(DaemonRpcError::internal(message).into()),
-                ErrorKind::Retryable => Err(DaemonRpcError::retryable(message).into()),
-            },
-        }
+        decode(self.call_raw_with_timeout(req, timeout).await?)
+    }
+
+    /// [`DaemonClient::call`] that sends the request id of `call` and records
+    /// the outcome and the answer on `call`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`DaemonClient::call`].
+    pub async fn call_logged<T: DeserializeOwned>(
+        &self,
+        req: DaemonRequest,
+        call: &mut ClientCall,
+    ) -> anyhow::Result<T> {
+        let timeout = timeout_for(&req.payload);
+        decode(
+            self.call_raw_with_timeout_logged(req, timeout, call)
+                .await?,
+        )
+    }
+}
+
+struct TimedCall {
+    result: anyhow::Result<DaemonResponse>,
+    outcome: Outcome,
+    answer: Option<Answer>,
+}
+
+fn kind_outcome(kind: ErrorKind) -> Outcome {
+    match kind {
+        ErrorKind::InvalidParams => Outcome::InvalidParams,
+        ErrorKind::Internal => Outcome::Internal,
+        ErrorKind::Retryable => Outcome::Retryable,
+    }
+}
+
+fn decode<T: DeserializeOwned>(response: DaemonResponse) -> anyhow::Result<T> {
+    match response {
+        DaemonResponse::Ok { result } => serde_json::from_value(result)
+            .map_err(|e| anyhow::anyhow!("daemon returned unexpected payload: {e}")),
+        DaemonResponse::Err { kind, message } => match kind {
+            ErrorKind::InvalidParams => Err(DaemonRpcError::invalid_params(message).into()),
+            ErrorKind::Internal => Err(DaemonRpcError::internal(message).into()),
+            ErrorKind::Retryable => Err(DaemonRpcError::retryable(message).into()),
+        },
     }
 }
 
@@ -378,10 +480,7 @@ mod tests {
         let started = std::time::Instant::now();
         let result = client
             .call_raw_with_timeout(
-                DaemonRequest {
-                    cwd: PathBuf::from("."),
-                    payload: DaemonRequestPayload::Ping,
-                },
+                DaemonRequest::new(PathBuf::from("."), DaemonRequestPayload::Ping),
                 Duration::from_millis(100),
             )
             .await;
@@ -496,10 +595,7 @@ mod tests {
         let client = connect_at(&sock_path).await.expect("connect");
         let err = client
             .call_raw_with_timeout(
-                DaemonRequest {
-                    cwd: PathBuf::from("."),
-                    payload: DaemonRequestPayload::Ping,
-                },
+                DaemonRequest::new(PathBuf::from("."), DaemonRequestPayload::Ping),
                 Duration::from_millis(100),
             )
             .await
@@ -538,10 +634,7 @@ mod tests {
         let client = connect_at(&sock_path).await.expect("connect");
         let err = client
             .call_raw_with_timeout(
-                DaemonRequest {
-                    cwd: PathBuf::from("."),
-                    payload: DaemonRequestPayload::Ping,
-                },
+                DaemonRequest::new(PathBuf::from("."), DaemonRequestPayload::Ping),
                 Duration::from_secs(5),
             )
             .await
@@ -555,10 +648,7 @@ mod tests {
     use super::super::framing::MAX_IPC_LINE_BYTES;
 
     fn ping_request() -> DaemonRequest {
-        DaemonRequest {
-            cwd: PathBuf::from("."),
-            payload: DaemonRequestPayload::Ping,
-        }
+        DaemonRequest::new(PathBuf::from("."), DaemonRequestPayload::Ping)
     }
 
     enum LineEnding {
@@ -672,9 +762,9 @@ mod tests {
     }
 
     fn markdown_batch_request(content: String) -> DaemonRequest {
-        DaemonRequest {
-            cwd: PathBuf::from("/"),
-            payload: DaemonRequestPayload::AddMarkdownBatch {
+        DaemonRequest::new(
+            PathBuf::from("/"),
+            DaemonRequestPayload::AddMarkdownBatch {
                 corpus: "wiki".into(),
                 items: vec![crate::ipc::AddMarkdownItem {
                     path: "once.md".into(),
@@ -686,7 +776,7 @@ mod tests {
                     replace_match: None,
                 }],
             },
-        }
+        )
     }
 
     #[tokio::test]

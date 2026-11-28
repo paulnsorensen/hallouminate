@@ -20,12 +20,13 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use hallouminate_config::Config;
+use hallouminate_daemon::oplog::OperationRecord;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::time::timeout;
 
-use crate::common::daemon::DaemonHarness;
+use crate::common::daemon::{DaemonHarness, read_segment_rows};
 
 // First-byte budget for one JSON-RPC reply. Each test spawns a fresh
 // `hallouminate serve` child plus a per-test daemon, and libtest runs ~ncpu
@@ -37,7 +38,7 @@ use crate::common::daemon::DaemonHarness;
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
-struct Mcp {
+pub(crate) struct Mcp {
     child: Child,
     // `Option` so the cooperative `shutdown` path can `take()` and drop
     // stdin to signal EOF without moving out of a struct that owns a
@@ -47,6 +48,9 @@ struct Mcp {
     // Directory `rpc()` auto-injects as `arguments.cwd` on `tools/call`
     // requests that omit it. Set from `spawn_with_cwd`'s `cwd` argument.
     cwd: PathBuf,
+    // `XDG_STATE_HOME` of the child, so its operations-log rows never land
+    // in the developer's real state directory.
+    state_home: PathBuf,
 }
 
 impl Drop for Mcp {
@@ -65,11 +69,11 @@ impl Mcp {
     /// per-test config dir. Optionally set `HALLOUMINATE_SOCKET` so the
     /// MCP tools dial the per-test daemon harness instead of the
     /// developer's real daemon socket.
-    async fn spawn(xdg_config_home: &Path, daemon_socket: Option<&Path>) -> Self {
+    pub(crate) async fn spawn(xdg_config_home: &Path, daemon_socket: Option<&Path>) -> Self {
         Self::spawn_with_cwd(xdg_config_home, xdg_config_home, daemon_socket, true).await
     }
 
-    async fn spawn_with_cwd(
+    pub(crate) async fn spawn_with_cwd(
         xdg_config_home: &Path,
         cwd: &Path,
         daemon_socket: Option<&Path>,
@@ -86,11 +90,13 @@ impl Mcp {
                 .expect("write empty repo-layer config");
         }
 
+        let state_home = xdg_config_home.join("state-home");
         let bin = env!("CARGO_BIN_EXE_hallouminate");
         let mut cmd = Command::new(bin);
         cmd.arg("serve")
             .current_dir(cwd)
             .env("XDG_CONFIG_HOME", xdg_config_home)
+            .env("XDG_STATE_HOME", &state_home)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -118,7 +124,13 @@ impl Mcp {
             stdin: Some(stdin),
             stdout,
             cwd: cwd.to_path_buf(),
+            state_home,
         }
+    }
+
+    /// Every `client_call` row the child wrote to its state directory.
+    pub(crate) fn client_rows(&self) -> Vec<OperationRecord> {
+        read_segment_rows(&self.state_home.join("hallouminate"))
     }
 
     async fn send(&mut self, value: Value) {
@@ -147,7 +159,7 @@ impl Mcp {
     /// asserting the `cwd` contract itself (AC-1/AC-2/AC-3/AC-4) must pass
     /// `cwd` explicitly or use `rpc_raw` so this injection is never the thing
     /// under test.
-    async fn rpc(&mut self, id: u64, method: &str, params: Value) -> Value {
+    pub(crate) async fn rpc(&mut self, id: u64, method: &str, params: Value) -> Value {
         let params = self.inject_cwd(method, params);
         self.rpc_raw(id, method, params).await
     }
@@ -203,7 +215,7 @@ impl Mcp {
         responses
     }
 
-    async fn notify(&mut self, method: &str, params: Value) {
+    pub(crate) async fn notify(&mut self, method: &str, params: Value) {
         self.send(json!({
             "jsonrpc": "2.0",
             "method": method,
@@ -212,7 +224,7 @@ impl Mcp {
         .await;
     }
 
-    async fn shutdown(&mut self) {
+    pub(crate) async fn shutdown(&mut self) {
         // Take + drop stdin to send EOF to the server; the `Drop` impl
         // would do the same on panic by killing the child outright.
         self.stdin.take();
@@ -221,7 +233,7 @@ impl Mcp {
     }
 }
 
-fn write_repo_config(dir: &Path, name: &str) {
+pub(crate) fn write_repo_config(dir: &Path, name: &str) {
     std::fs::create_dir_all(dir.join(".git")).expect("mkdir .git");
     std::fs::create_dir_all(dir.join(".hallouminate")).expect("mkdir .hallouminate");
     std::fs::write(
@@ -237,7 +249,7 @@ path = "."
     .expect("write repo config");
 }
 
-fn write_minimal_config(dir: &Path) {
+pub(crate) fn write_minimal_config(dir: &Path) {
     let cfg_dir = dir.join("hallouminate");
     std::fs::create_dir_all(&cfg_dir).expect("mkdir hallouminate config dir");
     std::fs::write(
@@ -305,7 +317,7 @@ ground_dir = "{ground}"
     toml::from_str(&toml).expect("parse config")
 }
 
-fn load_minimal_config(dir: &Path) -> Config {
+pub(crate) fn load_minimal_config(dir: &Path) -> Config {
     // Daemon opens LanceDB at startup regardless of corpus count, so even a
     // "minimal" config needs a tempdir ground or we'd hit the developer's
     // real `~/.local/share/hallouminate/ground` and either create/validate
@@ -1450,9 +1462,17 @@ async fn mcp_read_markdown_defaults_corpus_to_repo_wiki_when_omitted() {
             }),
         )
         .await;
+    let mut single = structured.clone();
+    let Some(single_fields) = single.as_object_mut() else {
+        panic!("structuredContent is not an object: {call}");
+    };
+    assert!(
+        single_fields.remove("request_id").is_some(),
+        "single call carries a request_id: {call}"
+    );
     assert_eq!(
         batch["result"]["structuredContent"]["results"][0]["result"],
-        *structured
+        single
     );
 
     mcp.shutdown().await;

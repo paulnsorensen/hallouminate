@@ -27,10 +27,15 @@ toml.workspace = true
 anyhow.workspace = true
 semver = "1"
 tracing.workspace = true
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
 chrono.workspace = true
+tempfile = "3"
+
+[features]
+# Exposes state hooks that only the integration suite of `hallouminate` uses.
+test-hooks = []
 
 [dev-dependencies]
-tempfile = "3"
 async-trait.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 text-splitter = { version = "0.33", features = ["markdown", "tokenizers"] }

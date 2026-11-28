@@ -2,6 +2,7 @@
 //! every other write (logs, errors, readiness announcements) must go to
 //! stderr or we corrupt the JSON-RPC stream.
 
+use hallouminate_daemon::oplog::OpLog;
 use rmcp::ServiceExt;
 use rmcp::transport::stdio;
 
@@ -9,11 +10,13 @@ use super::tools::HallouminateTools;
 
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-pub async fn serve_stdio() -> anyhow::Result<()> {
+/// Serves the MCP tools on stdio until the client disconnects. Each tool
+/// call writes one `client_call` row to `oplog`.
+pub async fn serve_stdio(oplog: OpLog) -> anyhow::Result<()> {
     eprintln!("hallouminate {SERVER_VERSION} MCP server listening on stdio");
     // Every tool call carries its own required `cwd`; the server holds no
     // startup-captured directory to fall back to.
-    let server = HallouminateTools::new();
+    let server = HallouminateTools::new(oplog);
     let running = server.serve(stdio()).await?;
     running.waiting().await?;
     Ok(())

@@ -14,6 +14,7 @@ use tokio::net::UnixStream;
 use super::bootstrap::ensure_daemon_running;
 use super::client::connect_at;
 use super::ipc::{DaemonRequest, DaemonRequestPayload, DaemonResponse, StatusReport};
+use super::oplog::{ClientCall, Outcome};
 use super::socket::daemon_socket_path;
 
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -40,20 +41,44 @@ pub async fn status() -> anyhow::Result<DaemonStatus> {
     status_at(&socket).await
 }
 
+/// [`status`] that records its daemon call on `call`.
+///
+/// # Errors
+///
+/// Returns the same errors as [`status`].
+pub async fn status_logged(call: &mut ClientCall) -> anyhow::Result<DaemonStatus> {
+    let socket = daemon_socket_path()?;
+    status_with(&socket, Some(call)).await
+}
+
 async fn status_at(socket: &Path) -> anyhow::Result<DaemonStatus> {
+    status_with(socket, None).await
+}
+
+pub(super) async fn status_with(
+    socket: &Path,
+    call: Option<&mut ClientCall>,
+) -> anyhow::Result<DaemonStatus> {
     let Ok(client) = connect_at(socket).await else {
+        if let Some(call) = call {
+            call.unanswered(Outcome::Unavailable);
+        }
         return Ok(DaemonStatus::NotRunning);
     };
-    match client
-        .call_raw_with_timeout(
-            DaemonRequest {
-                cwd: std::env::current_dir().unwrap_or_default(),
-                payload: DaemonRequestPayload::Status,
-            },
-            STATUS_TIMEOUT,
-        )
-        .await
-    {
+    let req = DaemonRequest::new(
+        std::env::current_dir().unwrap_or_default(),
+        DaemonRequestPayload::Status,
+    );
+    let response = match call {
+        Some(call) => {
+            call.ready();
+            client
+                .call_raw_with_timeout_logged(req, STATUS_TIMEOUT, call)
+                .await
+        }
+        None => client.call_raw_with_timeout(req, STATUS_TIMEOUT).await,
+    };
+    match response {
         Ok(DaemonResponse::Ok { result }) => {
             let report: StatusReport = serde_json::from_value(result)
                 .map_err(|e| anyhow::anyhow!("daemon returned unexpected status payload: {e}"))?;
@@ -77,20 +102,41 @@ pub async fn stop() -> anyhow::Result<()> {
     stop_at(&socket).await
 }
 
+/// [`stop`] that records its daemon call on `call`.
+///
+/// # Errors
+///
+/// Returns the same errors as [`stop`].
+pub async fn stop_logged(call: &mut ClientCall) -> anyhow::Result<()> {
+    let socket = daemon_socket_path()?;
+    stop_with(&socket, Some(call)).await
+}
+
 pub(super) async fn stop_at(socket: &Path) -> anyhow::Result<()> {
+    stop_with(socket, None).await
+}
+
+async fn stop_with(socket: &Path, call: Option<&mut ClientCall>) -> anyhow::Result<()> {
     let deadline = std::time::Instant::now() + STOP_TIMEOUT;
     let Ok(client) = connect_at(socket).await else {
+        if let Some(call) = call {
+            call.unanswered(Outcome::Unavailable);
+        }
         return Ok(());
     };
-    let _ = client
-        .call_raw_with_timeout(
-            DaemonRequest {
-                cwd: std::env::current_dir().unwrap_or_default(),
-                payload: DaemonRequestPayload::Shutdown,
-            },
-            STOP_TIMEOUT,
-        )
-        .await;
+    let req = DaemonRequest::new(
+        std::env::current_dir().unwrap_or_default(),
+        DaemonRequestPayload::Shutdown,
+    );
+    let _ = match call {
+        Some(call) => {
+            call.ready();
+            client
+                .call_raw_with_timeout_logged(req, STOP_TIMEOUT, call)
+                .await
+        }
+        None => client.call_raw_with_timeout(req, STOP_TIMEOUT).await,
+    };
 
     loop {
         if !socket.exists() || UnixStream::connect(socket).await.is_err() {
@@ -113,6 +159,17 @@ pub async fn restart() -> anyhow::Result<()> {
     restart_with(ensure_daemon_running).await
 }
 
+/// [`restart`] that records its daemon calls on `call`. The row outcome is
+/// the restart result: when no daemon ran, it is the outcome of the start.
+///
+/// # Errors
+///
+/// Returns the same errors as [`restart`].
+pub async fn restart_logged(call: &mut ClientCall) -> anyhow::Result<()> {
+    let socket = daemon_socket_path()?;
+    restart_at(&socket, Some(call), ensure_daemon_running).await
+}
+
 /// `restart` with an injectable respawn step — the test seam behind
 /// [`restart`]. Production calls `restart` (respawn = `ensure_daemon_running`).
 ///
@@ -129,15 +186,67 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<()>>,
 {
-    stop().await?;
-    respawn().await
+    let socket = daemon_socket_path()?;
+    restart_at(&socket, None, respawn).await
+}
+
+async fn restart_at<F, Fut>(
+    socket: &Path,
+    mut call: Option<&mut ClientCall>,
+    respawn: F,
+) -> anyhow::Result<()>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
+    stop_with(socket, call.as_deref_mut()).await?;
+    let result = respawn().await;
+    if let Some(call) = call {
+        match &result {
+            Ok(()) => call.settle(Outcome::Ok),
+            Err(_) => call.settle(Outcome::Unavailable),
+        }
+    }
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::ipc::{DebtLevel, TripState, WatcherCounters};
+    use super::super::oplog::{Client, OpLog, OperationRecord, RecordKind};
     use super::*;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    async fn restart_row_outcome(respawn: anyhow::Result<()>) -> OperationRecord {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("daemon.sock");
+        let log_dir = dir.path().join("log");
+        let oplog = OpLog::in_dir(&log_dir, &hallouminate_config::LoggingConfig::default());
+        let mut call = ClientCall::start(&oplog, Client::Cli, "restart", "shutdown", None);
+        let _ = restart_at(&socket, Some(&mut call), || async move { respawn }).await;
+        call.finish(Outcome::Ok);
+        let mut rows = Vec::new();
+        for entry in std::fs::read_dir(&log_dir).expect("log dir") {
+            let path = entry.expect("log dir entry").path();
+            for line in std::fs::read_to_string(&path).expect("segment").lines() {
+                rows.push(serde_json::from_str::<OperationRecord>(line).expect("row json"));
+            }
+        }
+        let [row] = <[OperationRecord; 1]>::try_from(rows).expect("one restart row");
+        let RecordKind::ClientCall(fields) = &row.kind else {
+            panic!("restart row must be a client_call row: {row:?}");
+        };
+        assert_eq!(fields.daemon_round_trip_ms, None, "{row:?}");
+        row
+    }
+
+    #[tokio::test]
+    async fn restart_without_running_daemon_records_start_outcome() {
+        let started = restart_row_outcome(Ok(())).await;
+        assert_eq!(started.outcome, Outcome::Ok, "{started:?}");
+        let failed = restart_row_outcome(Err(anyhow::anyhow!("no start"))).await;
+        assert_eq!(failed.outcome, Outcome::Unavailable, "{failed:?}");
+    }
 
     #[tokio::test]
     async fn status_reports_running_for_live_socket() {

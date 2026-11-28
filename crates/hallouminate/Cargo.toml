@@ -47,6 +47,7 @@ rust_xlsxwriter = "0.102"
 zip = "9.0.5"
 hallouminate-domain.workspace = true
 hallouminate-adapters.workspace = true
+hallouminate-daemon = { workspace = true, features = ["test-hooks"] }
 blake3.workspace = true
 serde_yaml_ng.workspace = true
 text-splitter = { version = "0.33", features = ["markdown", "tokenizers"] }
