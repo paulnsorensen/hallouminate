@@ -333,23 +333,14 @@ pub(crate) async fn gather_signals(
         }
     };
     if signals.hits.is_empty() {
-        let _ = resolve_rg_run(
-            rg_res,
-            RIPGREP_TIMEOUT,
-            &corpus_key.canonical_root,
-            &mut warnings,
-        );
+        let _ = resolve_rg_run(rg_res, RIPGREP_TIMEOUT, corpus_key, &mut warnings);
         return Ok(RootSignals {
             warnings,
             ..RootSignals::default()
         });
     }
-    let (rg_hits, rg_truncated, rg_elapsed_ms, rg_unparseable) = resolve_rg_run(
-        rg_res,
-        RIPGREP_TIMEOUT,
-        &corpus_key.canonical_root,
-        &mut warnings,
-    );
+    let (rg_hits, rg_truncated, rg_elapsed_ms, rg_unparseable) =
+        resolve_rg_run(rg_res, RIPGREP_TIMEOUT, corpus_key, &mut warnings);
 
     let (rg_chunk_counts, rg_stats) = resolve_rg_hits_to_chunks(&signals.hits, &rg_hits);
     let resolved_chunks = rg_chunk_counts.len();
@@ -357,6 +348,7 @@ pub(crate) async fn gather_signals(
 
     tracing::debug!(
         target: "hallouminate::search",
+        corpus = %corpus_key.name,
         rg_hits = rg_hits.len(),
         resolved_chunks,
         dropped_file_not_in_pool = rg_stats.dropped_file_not_in_pool,
@@ -374,14 +366,16 @@ pub(crate) async fn gather_signals(
                 files.insert(rg_hit.file_ref.clone());
             }
             unpooled_files = Some(files);
+        } else {
+            tracing::warn!(
+                target: "hallouminate::search",
+                corpus = %corpus_key.name,
+                rg_hits = rg_hits.len(),
+                dropped_file_not_in_pool = rg_stats.dropped_file_not_in_pool,
+                dropped_line_out_of_range = rg_stats.dropped_line_out_of_range,
+                "ripgrep signal produced hits but resolved to zero chunks"
+            );
         }
-        tracing::warn!(
-            target: "hallouminate::search",
-            rg_hits = rg_hits.len(),
-            dropped_file_not_in_pool = rg_stats.dropped_file_not_in_pool,
-            dropped_line_out_of_range = rg_stats.dropped_line_out_of_range,
-            "ripgrep signal produced hits but resolved to zero chunks"
-        );
         warnings.push(Warning {
             code: warning_codes::RIPGREP_UNRESOLVED.to_string(),
             message: format!(
@@ -398,6 +392,7 @@ pub(crate) async fn gather_signals(
     if rg_unparseable > 0 {
         tracing::warn!(
             target: "hallouminate::search",
+            corpus = %corpus_key.name,
             rg_unparseable,
             "ripgrep produced unparseable match events; the rg output schema may have changed"
         );
@@ -986,13 +981,14 @@ fn contains_term_counts(
 fn resolve_rg_run(
     rg_res: std::result::Result<Result<ripgrep::RipgrepRun>, tokio::time::error::Elapsed>,
     timeout: std::time::Duration,
-    root: &Path,
+    corpus_key: &CorpusKey,
     warnings: &mut Vec<Warning>,
 ) -> (Vec<RipgrepHit>, bool, u64, usize) {
+    let root = &corpus_key.canonical_root;
     match rg_res {
         Ok(Ok(run)) => (run.hits, run.truncated, run.elapsed_ms, run.unparseable),
         Ok(Err(error)) => {
-            tracing::warn!(target: "hallouminate::search", err = %error, "ripgrep pass failed; ranking without the ripgrep signal");
+            tracing::warn!(target: "hallouminate::search", corpus = %corpus_key.name, err = %error, "ripgrep pass failed; ranking without the ripgrep signal");
             warnings.push(Warning {
                 code: warning_codes::RIPGREP_FAILED.to_string(),
                 message: format!(
@@ -1005,6 +1001,7 @@ fn resolve_rg_run(
         Err(_elapsed) => {
             tracing::warn!(
                 target: "hallouminate::search",
+                corpus = %corpus_key.name,
                 timeout_ms = timeout.as_millis() as u64,
                 "ripgrep pass timed out; ranking without the ripgrep signal"
             );
@@ -1847,6 +1844,49 @@ mod tests {
         );
     }
 
+    struct UnresolvedRgFixture {
+        _root: tempfile::TempDir,
+        corpus_key: CorpusKey,
+        store: FakeFusionStore,
+    }
+
+    fn unresolved_rg_fixture(file_drops: usize, line_drops: usize) -> UnresolvedRgFixture {
+        let root = tempfile::tempdir().expect("ripgrep fixture root");
+        let corpus_key = CorpusKey {
+            name: "fixtures".into(),
+            canonical_root: root.path().canonicalize().expect("canonical fixture root"),
+        };
+        let mut candidates = vec![
+            hit("first", "/outside/first.md", 1, 1),
+            hit("second", "/outside/second.md", 1, 1),
+        ];
+        for index in 0..file_drops + line_drops {
+            let path = corpus_key
+                .canonical_root
+                .join(format!("match-{index:03}.md"));
+            std::fs::write(&path, "distinctiveterm private matched text\n")
+                .expect("write real ripgrep match");
+            if index >= file_drops {
+                candidates.push(hit(
+                    &format!("range-{index}"),
+                    path.to_str().expect("UTF-8 fixture path"),
+                    2,
+                    3,
+                ));
+            }
+        }
+        let store = FakeFusionStore {
+            fts: vec!["first".into(), "second".into()],
+            vector: vec!["second".into()],
+            hits: pool(candidates),
+        };
+        UnresolvedRgFixture {
+            _root: root,
+            corpus_key,
+            store,
+        }
+    }
+
     #[tokio::test]
     async fn unresolved_warning_reports_exact_drop_counts_and_truncation() {
         for (file_drops, line_drops, limit, truncated) in [
@@ -1856,35 +1896,11 @@ mod tests {
             (2, 0, 2, true),
             (50, 0, 100, false),
         ] {
-            let root = tempfile::tempdir().expect("ripgrep fixture root");
-            let corpus_key = CorpusKey {
-                name: "fixtures".into(),
-                canonical_root: root.path().canonicalize().expect("canonical fixture root"),
-            };
-            let mut candidates = vec![
-                hit("first", "/outside/first.md", 1, 1),
-                hit("second", "/outside/second.md", 1, 1),
-            ];
-            for index in 0..file_drops + line_drops {
-                let path = corpus_key
-                    .canonical_root
-                    .join(format!("match-{index:03}.md"));
-                std::fs::write(&path, "distinctiveterm private matched text\n")
-                    .expect("write real ripgrep match");
-                if index >= file_drops {
-                    candidates.push(hit(
-                        &format!("range-{index}"),
-                        path.to_str().expect("UTF-8 fixture path"),
-                        2,
-                        3,
-                    ));
-                }
-            }
-            let store = FakeFusionStore {
-                fts: vec!["first".into(), "second".into()],
-                vector: vec!["second".into()],
-                hits: pool(candidates),
-            };
+            let UnresolvedRgFixture {
+                _root,
+                corpus_key,
+                store,
+            } = unresolved_rg_fixture(file_drops, line_drops);
             let result = search_fused(&store, &corpus_key, "distinctiveterm", &[], limit)
                 .await
                 .expect("search with unresolved real ripgrep hits");
@@ -1903,6 +1919,192 @@ mod tests {
                     file_drops + line_drops,
                     corpus_key.canonical_root.display(),
                 ),
+            );
+        }
+    }
+
+    struct CapturedEvent {
+        level: tracing::Level,
+        fields: std::collections::BTreeMap<String, String>,
+    }
+
+    /// Records every `hallouminate::search` event with its level and fields.
+    #[derive(Clone, Default)]
+    struct SearchTraceCapture(std::sync::Arc<std::sync::Mutex<Vec<CapturedEvent>>>);
+
+    impl SearchTraceCapture {
+        fn events_at(
+            &self,
+            level: tracing::Level,
+        ) -> Vec<std::collections::BTreeMap<String, String>> {
+            let events = self.0.lock().expect("trace capture lock");
+            let mut matching = Vec::new();
+            for CapturedEvent {
+                level: event_level,
+                fields,
+            } in events.iter()
+            {
+                if *event_level == level {
+                    matching.push(fields.clone());
+                }
+            }
+            matching
+        }
+    }
+
+    struct FieldRecorder<'a>(&'a mut std::collections::BTreeMap<String, String>);
+
+    impl tracing::field::Visit for FieldRecorder<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0
+                .insert(field.name().to_string(), format!("{value:?}"));
+        }
+    }
+
+    impl tracing::Subscriber for SearchTraceCapture {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let metadata = event.metadata();
+            if metadata.target() != "hallouminate::search" {
+                return;
+            }
+            let mut fields = std::collections::BTreeMap::new();
+            event.record(&mut FieldRecorder(&mut fields));
+            self.0
+                .lock()
+                .expect("trace capture lock")
+                .push(CapturedEvent {
+                    level: *metadata.level(),
+                    fields,
+                });
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    #[tokio::test]
+    async fn file_not_in_pool_only_drops_log_at_debug_and_still_warns_the_caller() {
+        use tracing::instrument::WithSubscriber;
+
+        let UnresolvedRgFixture {
+            _root,
+            corpus_key,
+            store,
+        } = unresolved_rg_fixture(2, 0);
+        let capture = SearchTraceCapture::default();
+        let result = search_fused(&store, &corpus_key, "distinctiveterm", &[], 10)
+            .with_subscriber(capture.clone())
+            .await
+            .expect("search with pool-gated ripgrep hits");
+
+        let mut codes = Vec::new();
+        for warning in &result.warnings {
+            codes.push(warning.code.as_str());
+        }
+        assert_eq!(codes, vec!["ripgrep-unresolved"]);
+        let warns = capture.events_at(tracing::Level::WARN);
+        assert!(
+            warns.is_empty(),
+            "pool gating is expected, not a WARN: {warns:?}"
+        );
+        let mut resolved = Vec::new();
+        for fields in capture.events_at(tracing::Level::DEBUG) {
+            if fields.get("message").map(String::as_str) == Some("ripgrep signal resolved") {
+                resolved.push(fields);
+            }
+        }
+        assert_eq!(resolved.len(), 1, "{resolved:?}");
+        assert_eq!(
+            resolved[0].get("corpus").map(String::as_str),
+            Some("fixtures")
+        );
+        assert_eq!(
+            resolved[0].get("resolved_chunks").map(String::as_str),
+            Some("0")
+        );
+        assert_eq!(
+            resolved[0]
+                .get("dropped_file_not_in_pool")
+                .map(String::as_str),
+            Some("2")
+        );
+        assert_eq!(
+            resolved[0]
+                .get("dropped_line_out_of_range")
+                .map(String::as_str),
+            Some("0")
+        );
+    }
+
+    #[test]
+    fn failed_ripgrep_pass_warns_with_the_corpus() {
+        let UnresolvedRgFixture {
+            _root,
+            corpus_key,
+            store: _store,
+        } = unresolved_rg_fixture(0, 0);
+        let capture = SearchTraceCapture::default();
+        let mut warnings = Vec::new();
+        let failure = Err(crate::common::HallouminateError::Config(
+            "rg exploded".to_string(),
+        ));
+        tracing::subscriber::with_default(capture.clone(), || {
+            resolve_rg_run(Ok(failure), RIPGREP_TIMEOUT, &corpus_key, &mut warnings)
+        });
+
+        let warns = capture.events_at(tracing::Level::WARN);
+        assert_eq!(warns.len(), 1, "{warns:?}");
+        assert_eq!(warns[0].get("corpus").map(String::as_str), Some("fixtures"));
+    }
+
+    #[tokio::test]
+    async fn line_out_of_range_drops_warn_with_the_corpus() {
+        use tracing::instrument::WithSubscriber;
+
+        for (file_drops, line_drops) in [(0, 3), (2, 3)] {
+            let UnresolvedRgFixture {
+                _root,
+                corpus_key,
+                store,
+            } = unresolved_rg_fixture(file_drops, line_drops);
+            let capture = SearchTraceCapture::default();
+            search_fused(&store, &corpus_key, "distinctiveterm", &[], 10)
+                .with_subscriber(capture.clone())
+                .await
+                .expect("search with out-of-range ripgrep hits");
+
+            let warns = capture.events_at(tracing::Level::WARN);
+            assert_eq!(warns.len(), 1, "{warns:?}");
+            let warn = &warns[0];
+            assert_eq!(
+                warn.get("message").map(String::as_str),
+                Some("ripgrep signal produced hits but resolved to zero chunks")
+            );
+            assert_eq!(warn.get("corpus").map(String::as_str), Some("fixtures"));
+            assert_eq!(
+                warn.get("rg_hits"),
+                Some(&(file_drops + line_drops).to_string())
+            );
+            assert_eq!(
+                warn.get("dropped_file_not_in_pool"),
+                Some(&file_drops.to_string())
+            );
+            assert_eq!(
+                warn.get("dropped_line_out_of_range"),
+                Some(&line_drops.to_string())
             );
         }
     }
