@@ -5077,9 +5077,9 @@ dependencies = [
 
 [[package]]
 name = "notify-debouncer-full"
-version = "0.8.0-rc.4"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4a64b27d705b598bfa9522b8021a97c69a3458d896ccfdd62237326b3b671f43"
+checksum = "6b4029a4d8d71c0c466e412c30a0bf3bfb009677f6c4172a76a02d11f8d39047"
 dependencies = [
  "file-id",
  "log",
