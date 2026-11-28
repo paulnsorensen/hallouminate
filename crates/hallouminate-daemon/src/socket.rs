@@ -1,6 +1,9 @@
 //! Daemon socket path resolution.
 
-use std::ffi::{CStr, OsStr};
+#[cfg(unix)]
+use std::ffi::CStr;
+#[cfg(unix)]
+use std::ffi::OsStr;
 use std::io;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
@@ -19,9 +22,17 @@ pub fn daemon_socket_path() -> io::Result<PathBuf> {
     if let Some(explicit) = explicit.as_deref().filter(|value| !value.is_empty()) {
         return Ok(PathBuf::from(explicit));
     }
-    Ok(canonical_socket_path(account_home_for_current_user()?))
+    #[cfg(unix)]
+    {
+        Ok(canonical_socket_path(account_home_for_current_user()?))
+    }
+    #[cfg(windows)]
+    {
+        default_windows_socket_path()
+    }
 }
 
+#[cfg(unix)]
 fn account_home_for_current_user() -> io::Result<PathBuf> {
     let uid = rustix::process::geteuid().as_raw();
     let mut passwd = std::mem::MaybeUninit::<libc::passwd>::uninit();
@@ -45,9 +56,25 @@ fn account_home_for_current_user() -> io::Result<PathBuf> {
     Ok(PathBuf::from(OsStr::from_bytes(home.to_bytes())))
 }
 
+#[cfg(unix)]
 fn canonical_socket_path(account_home: PathBuf) -> PathBuf {
     account_home
         .join(".cache")
+        .join("hallouminate")
+        .join(SOCKET_NAME)
+}
+
+/// Resolves the account-home socket path and ignores `HALLOUMINATE_SOCKET`.
+#[cfg(windows)]
+pub(crate) fn default_windows_socket_path() -> io::Result<PathBuf> {
+    Ok(windows_socket_path(crate::windows_security::account_home()?))
+}
+
+#[cfg(windows)]
+fn windows_socket_path(account_home: PathBuf) -> PathBuf {
+    account_home
+        .join("AppData")
+        .join("Local")
         .join("hallouminate")
         .join(SOCKET_NAME)
 }
@@ -56,11 +83,21 @@ fn canonical_socket_path(account_home: PathBuf) -> PathBuf {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn canonical_path_uses_account_home() {
         assert_eq!(
             canonical_socket_path(PathBuf::from("/accounts/ada")),
             PathBuf::from("/accounts/ada/.cache/hallouminate/daemon.sock")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn canonical_path_uses_windows_account_home() {
+        assert_eq!(
+            windows_socket_path(PathBuf::from(r"C:\Users\ada")),
+            PathBuf::from(r"C:\Users\ada\AppData\Local\hallouminate\daemon.sock")
         );
     }
 }

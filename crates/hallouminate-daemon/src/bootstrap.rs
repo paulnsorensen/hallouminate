@@ -10,12 +10,15 @@
 //! `serve` launches: only one spawned daemon wins the lock; the others exit
 //! cleanly and every `serve` polls the same socket.
 
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use tokio::net::UnixStream;
+use super::transport::LocalStream;
 
 use super::client::connect_at;
 use super::ipc::{DaemonRequest, DaemonRequestPayload, DaemonResponse};
@@ -96,13 +99,17 @@ pub async fn ensure_daemon_running() -> anyhow::Result<()> {
     let log_err = log.try_clone()?;
 
     let exe = std::env::current_exe()?;
-    Command::new(&exe)
+    let mut command = Command::new(&exe);
+    command
         .arg("daemon")
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
-        .stderr(Stdio::from(log_err))
-        .process_group(0)
-        .spawn()?;
+        .stderr(Stdio::from(log_err));
+    #[cfg(unix)]
+    command.process_group(0);
+    #[cfg(windows)]
+    command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+    command.spawn()?;
 
     let started = std::time::Instant::now();
     let socket_for_connect = socket.to_path_buf();
@@ -112,7 +119,7 @@ pub async fn ensure_daemon_running() -> anyhow::Result<()> {
         CONNECTION_BUDGET,
         move || {
             let socket = socket_for_connect.clone();
-            async move { UnixStream::connect(socket).await.is_ok() }
+            async move { LocalStream::connect(socket).await.is_ok() }
         },
         tokio::time::sleep,
         || started.elapsed(),
@@ -121,8 +128,19 @@ pub async fn ensure_daemon_running() -> anyhow::Result<()> {
 }
 
 async fn probe_running_daemon(socket: &Path) -> Option<(SkewVerdict, Option<String>)> {
-    connect_at(socket).await.ok()?;
-    Some(running_daemon_verdict(socket).await)
+    let Err(error) = connect_at(socket).await else {
+        return Some(running_daemon_verdict(socket).await);
+    };
+    // A saturated Windows daemon refuses with a busy pipe, not an absent one.
+    #[cfg(windows)]
+    if error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(super::transport::is_pipe_busy)
+    {
+        return Some((SkewVerdict::Adopt, None));
+    }
+    drop(error);
+    None
 }
 
 async fn wait_for_daemon_socket<Connect, ConnectFuture, Sleep, SleepFuture, Elapsed>(
@@ -165,7 +183,7 @@ where
 
 /// Pure predicate split out so tests can exercise both branches without
 /// mutating process env (unsafe on edition 2024).
-fn has_explicit_socket_override(env_value: Option<&std::ffi::OsStr>) -> bool {
+pub(super) fn has_explicit_socket_override(env_value: Option<&std::ffi::OsStr>) -> bool {
     env_value.is_some_and(|v| !v.is_empty())
 }
 
@@ -342,7 +360,7 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let socket = dir.path().join("daemon.sock");
-        let listener = tokio::net::UnixListener::bind(&socket).expect("bind socket");
+        let listener = crate::transport::LocalListener::bind(&socket).expect("bind socket");
         let server = tokio::spawn(async move {
             loop {
                 let (stream, _) = listener.accept().await.expect("accept");

@@ -86,10 +86,29 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
+  # Compile and lint the Windows daemon code. Its tests need the Windows test
+  # fixture fixes that arrive with the full Windows verification job.
+  windows-daemon:
+    name: windows daemon (clippy)
+    runs-on: windows-2022
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install Rust toolchain
+        run: rustup show && rustup component add clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Clippy
+        run: cargo clippy --locked -p hallouminate-daemon --all-targets -- -D warnings
+
   build-test-matrix:
     name: build & test (${{ matrix.os }})
-    # Unix only: the crate is unix-only (libc path handling won't compile on
-    # Windows — tracked in #48).
+    # Ubuntu and macOS legs; the Windows daemon transport has its own job.
     needs: setup
     strategy:
       fail-fast: false

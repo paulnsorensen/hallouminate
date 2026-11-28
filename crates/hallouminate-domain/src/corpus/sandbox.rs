@@ -205,11 +205,10 @@ fn validate_windows_relative_path(raw: &str) -> Result<(), SandboxError> {
             return Err(SandboxError::new("path contains a Windows device name"));
         }
         for prefix in ["COM", "LPT"] {
-            if let Some(suffix) = stem.strip_prefix(prefix) {
-                if ["1", "2", "3", "4", "5", "6", "7", "8", "9", "¹", "²", "³"].contains(&suffix)
-                {
-                    return Err(SandboxError::new("path contains a Windows device name"));
-                }
+            if let Some(suffix) = stem.strip_prefix(prefix)
+                && ["1", "2", "3", "4", "5", "6", "7", "8", "9", "¹", "²", "³"].contains(&suffix)
+            {
+                return Err(SandboxError::new("path contains a Windows device name"));
             }
         }
     }
@@ -481,7 +480,7 @@ fn sort_tree(node: &mut TreeNode) {
 /// `ErrorData`). `Symlink` and `InvalidPath` are normalized across platforms
 /// by the `classify_*_errno` helpers so a caller sees one stable kind
 /// regardless of whether Linux or macOS raised the underlying errno.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum WriteErrorKind {
     /// File exists and `overwrite=false`.
     Exists,
@@ -993,10 +992,12 @@ fn reject_symlink_leaf(parent: &Dir, name: &OsStr) -> Result<(), WriteError> {
 /// instead of trusting the OS default (`0o666` minus umask), mirroring the
 /// same explicit-mode restore `open_or_create_child_dir` applies to
 /// directories (`0o755`).
+#[cfg(unix)]
 const NEW_FILE_MODE: u32 = 0o644;
 
 #[derive(Clone, Copy)]
 enum ReplaceTarget {
+    #[cfg(unix)]
     Existing(u32),
     Missing,
 }

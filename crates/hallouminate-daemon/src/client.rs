@@ -9,11 +9,10 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::Context;
+use super::transport::LocalStream;
 use futures_util::StreamExt;
 use serde::de::DeserializeOwned;
 use tokio::io::AsyncWriteExt;
-use tokio::net::UnixStream;
 
 use super::bootstrap::ensure_daemon_running;
 use super::framing::{MAX_IPC_LINE_BYTES, ipc_lines};
@@ -29,11 +28,16 @@ pub struct DaemonClient {
 
 /// Connect to the daemon. Returns `Err` with a clear "daemon unavailable"
 /// message when the socket is missing, unreadable, or the connect fails.
+/// A live Windows daemon with every pipe instance in use returns a retryable
+/// busy error instead.
 pub async fn daemon_client() -> anyhow::Result<DaemonClient> {
     let socket = daemon_socket_path()?;
-    connect_at(&socket)
-        .await
-        .map_err(|_| daemon_client_unavailable(socket.display()))
+    connect_at(&socket).await.map_err(|error| {
+        if daemon_busy(&error) {
+            return error;
+        }
+        daemon_client_unavailable(socket.display())
+    })
 }
 
 /// Connect to the daemon at an explicit socket path when set, otherwise
@@ -68,7 +72,8 @@ where
 }
 
 /// Connect to `socket`; on failure run `respawn` once and retry the same
-/// socket.
+/// socket. A busy daemon is alive, so it returns the retryable busy error
+/// without a respawn.
 async fn connect_or_spawn<F, Fut>(socket: &Path, respawn: F) -> anyhow::Result<DaemonClient>
 where
     F: FnOnce() -> Fut,
@@ -76,6 +81,7 @@ where
 {
     match connect_at(socket).await {
         Ok(client) => Ok(client),
+        Err(error) if daemon_busy(&error) => Err(error),
         Err(_) => {
             respawn().await?;
             connect_at(socket).await
@@ -98,16 +104,69 @@ pub fn daemon_client_unavailable(reason: impl std::fmt::Display) -> anyhow::Erro
 pub async fn connect_at(socket: &Path) -> anyhow::Result<DaemonClient> {
     // Probe the socket with a quick connect to confirm a daemon is alive,
     // surfacing the failure here instead of inside the first `call`.
-    UnixStream::connect(socket).await.with_context(|| {
-        format!(
+    probed(socket, LocalStream::connect(socket).await)
+}
+
+/// [`connect_at`] that retries a busy Windows pipe until `deadline`.
+#[cfg(windows)]
+pub(super) async fn connect_at_until(
+    socket: &Path,
+    deadline: tokio::time::Instant,
+) -> anyhow::Result<DaemonClient> {
+    probed(socket, LocalStream::connect_until(socket, deadline).await)
+}
+
+fn probed(socket: &Path, probe: std::io::Result<LocalStream>) -> anyhow::Result<DaemonClient> {
+    if let Err(error) = probe {
+        if is_busy_pipe(&error) {
+            return Err(busy_failure(socket, error));
+        }
+        return Err(anyhow::Error::new(error).context(format!(
             "daemon unavailable: cannot connect to {} \
              (start it with `hallouminate daemon`)",
             socket.display()
-        )
-    })?;
+        )));
+    }
     Ok(DaemonClient {
         socket: socket.to_path_buf(),
     })
+}
+
+/// Types a failed connect: a busy Windows pipe means a live daemon with no
+/// free instance, so the caller can retry; any other failure means no daemon.
+fn connect_failure(socket: &Path, error: std::io::Error) -> anyhow::Error {
+    if is_busy_pipe(&error) {
+        return busy_failure(socket, error);
+    }
+    daemon_client_unavailable(format!("connect to {} failed: {error}", socket.display()))
+}
+
+/// Wraps a busy-pipe error in a retryable [`DaemonRpcError`].
+///
+/// The I/O error stays the source, so callers can still match its OS code.
+fn busy_failure(socket: &Path, error: std::io::Error) -> anyhow::Error {
+    anyhow::Error::new(error).context(DaemonRpcError::retryable(format!(
+        "daemon at {} is busy; every pipe instance is in use — retry",
+        socket.display(),
+    )))
+}
+
+/// Reports whether a connect error came from a live daemon whose pipe
+/// instances are all in use.
+pub(super) fn daemon_busy(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(is_busy_pipe)
+}
+
+#[cfg(windows)]
+fn is_busy_pipe(error: &std::io::Error) -> bool {
+    super::transport::is_pipe_busy(error)
+}
+
+#[cfg(not(windows))]
+fn is_busy_pipe(_error: &std::io::Error) -> bool {
+    false
 }
 
 impl DaemonClient {
@@ -128,9 +187,9 @@ impl DaemonClient {
             )
             .into());
         }
-        let mut stream = UnixStream::connect(&self.socket).await.map_err(|e| {
-            daemon_client_unavailable(format!("connect to {} failed: {e}", self.socket.display()))
-        })?;
+        let mut stream = LocalStream::connect(&self.socket)
+            .await
+            .map_err(|e| connect_failure(&self.socket, e))?;
         // Wrap mid-call I/O errors with the same `daemon unavailable` hint
         // the initial connect uses. Without this, a daemon that dies after
         // the connect succeeds (write fails, read returns EOF, response
@@ -316,7 +375,7 @@ mod tests {
     async fn connect_or_spawn_prefers_live_socket_over_spawning() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let socket = tmp.path().join("daemon.sock");
-        let listener = tokio::net::UnixListener::bind(&socket).expect("bind socket");
+        let listener = crate::transport::LocalListener::bind(&socket).expect("bind socket");
         tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
@@ -366,7 +425,7 @@ mod tests {
         // the whole round trip and return promptly instead of hanging.
         let tmp = tempfile::tempdir().expect("tempdir");
         let sock_path = tmp.path().join("silent.sock");
-        let listener = tokio::net::UnixListener::bind(&sock_path).expect("bind");
+        let listener = crate::transport::LocalListener::bind(&sock_path).expect("bind");
         tokio::spawn(async move {
             // Accept and hold the connection open without ever reading or
             // writing — simulates a wedged daemon.
@@ -487,7 +546,7 @@ mod tests {
         // so "start it with `hallouminate daemon`" would be the wrong hint.
         let tmp = tempfile::tempdir().expect("tempdir");
         let sock_path = tmp.path().join("silent.sock");
-        let listener = tokio::net::UnixListener::bind(&sock_path).expect("bind");
+        let listener = crate::transport::LocalListener::bind(&sock_path).expect("bind");
         tokio::spawn(async move {
             let (_stream, _addr) = listener.accept().await.expect("accept");
             std::future::pending::<()>().await;
@@ -525,7 +584,7 @@ mod tests {
         // against a dead daemon cannot succeed.
         let tmp = tempfile::tempdir().expect("tempdir");
         let sock_path = tmp.path().join("eof.sock");
-        let listener = tokio::net::UnixListener::bind(&sock_path).expect("bind");
+        let listener = crate::transport::LocalListener::bind(&sock_path).expect("bind");
         tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
@@ -593,7 +652,7 @@ mod tests {
     async fn call_with_response(bytes: Vec<u8>) -> anyhow::Result<DaemonResponse> {
         let tmp = tempfile::tempdir().expect("tempdir");
         let socket = tmp.path().join("response.sock");
-        let listener = tokio::net::UnixListener::bind(&socket).expect("bind");
+        let listener = crate::transport::LocalListener::bind(&socket).expect("bind");
         let server = tokio::spawn(async move {
             let (probe, _) = listener.accept().await.expect("accept probe");
             drop(probe);
@@ -701,7 +760,7 @@ mod tests {
         );
         let tmp = tempfile::tempdir().expect("temp");
         let socket = tmp.path().join("frame.sock");
-        let listener = tokio::net::UnixListener::bind(&socket).expect("bind");
+        let listener = crate::transport::LocalListener::bind(&socket).expect("bind");
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");
             let (read, mut write) = stream.into_split();
@@ -740,7 +799,7 @@ mod tests {
     async fn markdown_batch_timeout_reports_uncertainty_without_replay() {
         let tmp = tempfile::tempdir().expect("temp");
         let socket = tmp.path().join("timeout.sock");
-        let listener = tokio::net::UnixListener::bind(&socket).expect("bind");
+        let listener = crate::transport::LocalListener::bind(&socket).expect("bind");
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");
             let mut lines = ipc_lines(stream);
@@ -772,5 +831,46 @@ mod tests {
             error.message
         );
         server.await.expect("server");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn busy_pipe_is_retryable_and_never_respawns() {
+        use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("daemon.sock");
+        std::fs::write(&socket, "cd".repeat(32)).expect("write endpoint marker");
+        let name = crate::transport::pipe_name(&socket).expect("pipe name");
+        let server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .max_instances(1)
+            .create(&name)
+            .expect("create single-instance pipe");
+        let held = ClientOptions::new().open(&name).expect("occupy pipe");
+        server.connect().await.expect("accept occupying client");
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_ref = Arc::clone(&calls);
+        let error = connect_or_spawn(&socket, || {
+            calls_ref.fetch_add(1, Ordering::SeqCst);
+            async { anyhow::Ok(()) }
+        })
+        .await
+        .expect_err("a permanently busy pipe must fail");
+
+        assert!(daemon_busy(&error), "busy cause must survive: {error:#}");
+        let rpc = error
+            .downcast_ref::<DaemonRpcError>()
+            .expect("busy pipe must surface as a typed DaemonRpcError");
+        assert_eq!(rpc.kind, ErrorKind::Retryable, "{}", rpc.message);
+        assert!(rpc.message.contains("busy"), "{}", rpc.message);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a busy daemon is alive, so it must not be respawned",
+        );
+        drop(held);
+        drop(server);
     }
 }
