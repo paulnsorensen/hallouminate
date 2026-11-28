@@ -143,7 +143,7 @@ pub fn first_corpus_root(corpus: &CorpusConfig) -> Result<PathBuf, SandboxError>
 /// the corpus root.
 pub fn safe_relative_path(raw: &str) -> Result<PathBuf, SandboxError> {
     let path = Path::new(raw);
-    if path.as_os_str().is_empty() || path.is_absolute() {
+    if path.as_os_str().is_empty() || path.has_root() {
         return Err(SandboxError::new("path must be a non-empty relative path"));
     }
     // NUL bytes in path components can't be passed to syscalls — reject at
@@ -174,7 +174,49 @@ pub fn safe_relative_path(raw: &str) -> Result<PathBuf, SandboxError> {
             "path must contain only normal file components",
         ));
     }
+    #[cfg(windows)]
+    validate_windows_relative_path(raw)?;
     Ok(path.to_path_buf())
+}
+
+#[cfg(windows)]
+fn validate_windows_relative_path(raw: &str) -> Result<(), SandboxError> {
+    for component in raw.split(['/', '\\']) {
+        for character in component.chars() {
+            if ('\u{0}'..='\u{1f}').contains(&character) {
+                return Err(SandboxError::new(
+                    "path contains a Windows control character",
+                ));
+            }
+        }
+        if component == "." || component.ends_with(['.', ' ']) {
+            return Err(SandboxError::new(
+                "path must contain only normal file components",
+            ));
+        }
+        if component.contains([':', '<', '>', '"', '|', '?', '*']) {
+            return Err(SandboxError::new(
+                "path contains a Windows reserved character",
+            ));
+        }
+        let stem = component.split('.').next().unwrap_or_default();
+        let stem = stem.trim_end_matches(' ').to_uppercase();
+        if ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"].contains(&stem.as_str()) {
+            return Err(SandboxError::new("path contains a Windows device name"));
+        }
+        for prefix in ["COM", "LPT"] {
+            if let Some(suffix) = stem.strip_prefix(prefix) {
+                if ["1", "2", "3", "4", "5", "6", "7", "8", "9", "¹", "²", "³"].contains(&suffix)
+                {
+                    return Err(SandboxError::new("path contains a Windows device name"));
+                }
+            }
+        }
+    }
+    if raw.ends_with('\\') {
+        return Err(SandboxError::new("path must name a file"));
+    }
+    Ok(())
 }
 
 /// The directory include/exclude patterns anchor to for a corpus root. A
@@ -774,11 +816,26 @@ pub fn delete_no_follow(root: &Path, relative: &Path) -> Result<(), WriteError> 
 }
 
 fn normal_components(path: &Path) -> Result<Vec<OsString>, WriteError> {
+    #[cfg(windows)]
+    {
+        let Some(path) = path.to_str() else {
+            return Err(invalid_path_error("relative path must be valid Unicode"));
+        };
+        validate_windows_relative_path(path).map_err(|error| {
+            WriteError::new(
+                WriteErrorKind::InvalidPath,
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, error),
+            )
+        })?;
+    }
     let mut out = Vec::new();
     for component in path.components() {
         match component {
             Component::Normal(name) => out.push(name.to_os_string()),
-            _ => {
+            Component::Prefix(_)
+            | Component::RootDir
+            | Component::CurDir
+            | Component::ParentDir => {
                 return Err(invalid_path_error(
                     "path must contain only normal file components",
                 ));
@@ -959,11 +1016,22 @@ fn write_new_file(parent: &Dir, name: &OsStr, content: &[u8]) -> Result<(), Writ
     }
     let cap_file = parent
         .open_with(name, &opts)
-        .map_err(classify_create_io_error)?;
+        .map_err(|error| classify_new_file_error(parent, name, error))?;
     let mut file = cap_file.into_std();
     write_and_sync(&mut file, content)?;
     drop(file);
     fsync_dir(parent)
+}
+
+/// Classifies a failed `create_new` open. Windows reports an existing
+/// directory as access denied where Unix reports `EEXIST`, so an existing
+/// entry behind `PermissionDenied` maps to `Exists` on both platforms.
+fn classify_new_file_error(parent: &Dir, name: &OsStr, error: std::io::Error) -> WriteError {
+    if error.kind() == std::io::ErrorKind::PermissionDenied && parent.symlink_metadata(name).is_ok()
+    {
+        return WriteError::new(WriteErrorKind::Exists, error);
+    }
+    classify_create_io_error(error)
 }
 
 fn atomic_replace(parent: &Dir, name: &OsStr, content: &[u8]) -> Result<(), WriteError> {
@@ -1091,39 +1159,36 @@ fn fsync_dir(dir: &Dir) -> Result<(), WriteError> {
         .map_err(|e| WriteError::new(WriteErrorKind::Io, e))
 }
 
-// Numeric errno constants used in path-error classification.
-//
-// AC2 of the cap-std migration spec ("`rustix::io::Errno` is also removed")
-// is intentionally partial here, as an explicit reviewed trade-off rather
-// than inherited rustix coupling. The reason: `std::io::ErrorKind` gates
-// `NotADirectory`, `IsADirectory`, `FilesystemLoop`, and `InvalidFilename`
-// behind the unstable `io_error_more` feature on Rust 1.91 (the project's
-// MSRV), so the public `WriteErrorKind` discrimination callers depend on
-// has to come from `raw_os_error()` matches. The three alternatives all
-// have worse trade-offs:
-//
-//   1. Hand-rolled platform-cfg-gated constants — banned by the spec
-//      ("No new `#[cfg(unix)]` / `#[cfg(windows)]` gates inside
-//      `sandbox.rs`").
-//   2. Add `libc` as a direct dep just for the constants — heavyweight
-//      for a four-constant ask.
-//   3. Wait for `io_error_more` to stabilise — open-ended, MSRV-bound.
-//
-// The spec's Risk Register entry on `classify_path_error` already
-// anticipated this gap. `rustix::io::Errno`'s associated constants are
-// stable, cross-platform names that resolve to the right raw errno per
-// target, and rustix is already a workspace dep (kept for
-// `process::kill_process` in tests and `fs::flock` in
-// `src/app/daemon/server.rs`).
-//
-// Linux/macOS: ELOOP=Linux 40 / macOS 62, ENOTDIR=20, EISDIR=21, EINVAL=22.
-// Windows: cap-std maps native errors into the rustix errno namespace via
-// its translation layer; runtime verification is deferred to a later curd
-// per the spec's Verification Plan.
+#[cfg(unix)]
 const ELOOP: i32 = rustix::io::Errno::LOOP.raw_os_error();
+#[cfg(unix)]
 const ENOTDIR: i32 = rustix::io::Errno::NOTDIR.raw_os_error();
+#[cfg(unix)]
 const EISDIR: i32 = rustix::io::Errno::ISDIR.raw_os_error();
+#[cfg(unix)]
 const EINVAL: i32 = rustix::io::Errno::INVAL.raw_os_error();
+
+// Windows has no errno values. These POSIX-named constants hold the Win32
+// codes that cap-primitives maps to the same categories; see
+// cap-primitives `src/windows/fs/errors.rs`.
+#[cfg(windows)]
+const ELOOP: i32 = windows_sys::Win32::Foundation::ERROR_TOO_MANY_LINKS as i32;
+#[cfg(windows)]
+const ENOTDIR: i32 = windows_sys::Win32::Foundation::ERROR_DIRECTORY as i32;
+#[cfg(windows)]
+const EISDIR: i32 = windows_sys::Win32::Foundation::ERROR_DIRECTORY_NOT_SUPPORTED as i32;
+#[cfg(windows)]
+const EINVAL: i32 = windows_sys::Win32::Foundation::ERROR_INVALID_NAME as i32;
+
+fn is_symlink_error(raw: i32) -> bool {
+    #[cfg(windows)]
+    if raw == windows_sys::Win32::Foundation::ERROR_CANT_RESOLVE_FILENAME as i32
+        || raw == windows_sys::Win32::Foundation::ERROR_STOPPED_ON_SYMLINK as i32
+    {
+        return true;
+    }
+    raw == ELOOP
+}
 
 /// Classify an error from a non-create path operation (open_dir, open,
 /// symlink_metadata on an intermediate component). Preserves the historical
@@ -1131,7 +1196,7 @@ const EINVAL: i32 = rustix::io::Errno::INVAL.raw_os_error();
 /// depend on.
 fn classify_path_io_error(err: std::io::Error) -> WriteError {
     if let Some(raw) = err.raw_os_error() {
-        if raw == ELOOP {
+        if is_symlink_error(raw) {
             return WriteError::new(WriteErrorKind::Symlink, err);
         }
         if raw == ENOTDIR || raw == EINVAL {
@@ -1156,7 +1221,7 @@ fn classify_path_io_error(err: std::io::Error) -> WriteError {
 /// `EISDIR → InvalidPath` mapping the old `Errno::ISDIR` branch had.
 fn classify_create_io_error(err: std::io::Error) -> WriteError {
     if let Some(raw) = err.raw_os_error() {
-        if raw == ELOOP {
+        if is_symlink_error(raw) {
             return WriteError::new(WriteErrorKind::Symlink, err);
         }
         if raw == ENOTDIR || raw == EISDIR || raw == EINVAL {
@@ -1174,8 +1239,8 @@ fn classify_create_io_error(err: std::io::Error) -> WriteError {
 
 fn symlink_io_error() -> std::io::Error {
     // Construct a synthetic ELOOP-bearing error so callers that inspect
-    // `WriteError.source.raw_os_error()` see the same value the rustix-era
-    // code returned via `Errno::LOOP.into()`.
+    // `WriteError.source.raw_os_error()` see the same value on every
+    // platform: `Errno::LOOP` on Unix, `ERROR_TOO_MANY_LINKS` on Windows.
     std::io::Error::from_raw_os_error(ELOOP)
 }
 
@@ -1197,6 +1262,65 @@ mod tests {
     //! immediately legible.
 
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_paths_reject_device_names_streams_and_aliases() {
+        for path in [
+            "NUL.md",
+            "dir/con",
+            "COM1.txt",
+            "lpt².md",
+            "CON .md",
+            "CONIN$",
+            "file.md:secret",
+            "dir/file.",
+            "dir/file ",
+            "dir\\.\\file.md",
+            "dir\\file\\",
+            "C:relative.md",
+            "C:\\absolute.md",
+            "\\\\server\\share\\file.md",
+            "dir/file\u{1}.md",
+        ] {
+            assert!(safe_relative_path(path).is_err(), "accepted {path:?}");
+        }
+        for path in [
+            "notes.md",
+            "dir\\file.md",
+            "dir/file.md",
+            "COM10.md",
+            "unicode/日本語.md",
+            "dir/file\u{7f}.md",
+        ] {
+            assert!(safe_relative_path(path).is_ok(), "rejected {path:?}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_errors_preserve_sandbox_error_categories() {
+        use windows_sys::Win32::Foundation::{
+            ERROR_CANT_RESOLVE_FILENAME, ERROR_DIRECTORY, ERROR_DIRECTORY_NOT_SUPPORTED,
+            ERROR_INVALID_NAME, ERROR_STOPPED_ON_SYMLINK, ERROR_TOO_MANY_LINKS,
+        };
+        for code in [
+            ERROR_TOO_MANY_LINKS,
+            ERROR_CANT_RESOLVE_FILENAME,
+            ERROR_STOPPED_ON_SYMLINK,
+        ] {
+            let error = classify_path_io_error(std::io::Error::from_raw_os_error(code as i32));
+            assert_eq!(error.kind, WriteErrorKind::Symlink);
+        }
+        for code in [
+            ERROR_DIRECTORY,
+            ERROR_DIRECTORY_NOT_SUPPORTED,
+            ERROR_INVALID_NAME,
+        ] {
+            let error = classify_create_io_error(std::io::Error::from_raw_os_error(code as i32));
+            assert_eq!(error.kind, WriteErrorKind::InvalidPath);
+        }
+    }
 
     fn cfg(name: &str, paths: Vec<&str>) -> CorpusConfig {
         CorpusConfig {
@@ -1979,6 +2103,32 @@ mod tests {
         assert!(matches!(err.kind, WriteErrorKind::InvalidPath), "{err:?}");
     }
 
+    #[test]
+    fn atomic_write_no_follow_over_existing_directory_reports_unix_kinds() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("notes.md")).unwrap();
+        let Err(error) = atomic_write_no_follow(tmp.path(), Path::new("notes.md"), b"x", false)
+        else {
+            panic!("create_new over a directory succeeded");
+        };
+        match error.kind {
+            WriteErrorKind::Exists => {}
+            WriteErrorKind::Symlink | WriteErrorKind::InvalidPath | WriteErrorKind::Io => {
+                panic!("overwrite=false: {error:?}")
+            }
+        }
+        let Err(error) = atomic_write_no_follow(tmp.path(), Path::new("notes.md"), b"x", true)
+        else {
+            panic!("replace over a directory succeeded");
+        };
+        match error.kind {
+            WriteErrorKind::InvalidPath => {}
+            WriteErrorKind::Exists | WriteErrorKind::Symlink | WriteErrorKind::Io => {
+                panic!("overwrite=true: {error:?}")
+            }
+        }
+        assert!(tmp.path().join("notes.md").is_dir());
+    }
     #[test]
     fn atomic_write_no_follow_rejects_regular_file_as_intermediate_dir_component() {
         // If a normal file sits where the writer expects a directory,
